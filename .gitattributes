@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.mid binary
+*.clav binary
+*.pdf binary
