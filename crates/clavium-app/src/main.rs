@@ -183,11 +183,11 @@ impl ClaviumApp {
         ui.horizontal(|ui| {
             match &self.connection {
                 Connection::Connected(port) => {
-                    ui.label(RichText::new("●").color(OK_GREEN).size(18.0));
+                    status_dot(ui, OK_GREEN);
                     ui.label(RichText::new(format!("{port} conectado")).strong());
                 }
                 Connection::Searching { lost } => {
-                    ui.label(RichText::new("●").color(WARN_AMBER).size(18.0));
+                    status_dot(ui, WARN_AMBER);
                     let text = match lost {
                         Some(port) => format!("Se desconectó {port}. Buscando teclado…"),
                         None => "Buscando teclado… conectalo por USB".to_string(),
@@ -195,7 +195,7 @@ impl ClaviumApp {
                     ui.label(text);
                 }
                 Connection::Failed { port, .. } => {
-                    ui.label(RichText::new("●").color(WARN_AMBER).size(18.0));
+                    status_dot(ui, WARN_AMBER);
                     ui.label(format!(
                         "No se pudo abrir {port}. Puede estar en uso por otra app: cerrala y Clavium lo vuelve a intentar solo."
                     ));
@@ -349,8 +349,8 @@ impl ClaviumApp {
                         PortKind::Device => "dispositivo",
                         PortKind::Virtual => "virtual",
                     };
-                    let marker = if connected { "● " } else { "   " };
-                    ui.label(format!("{marker}{port}  ({kind})"));
+                    let state = if connected { ", conectado" } else { "" };
+                    ui.label(format!("{port}  ({kind}{state})"));
                 }
                 ui.separator();
                 ui.heading("Latencia");
@@ -400,6 +400,13 @@ impl eframe::App for ClaviumApp {
                 .record(now.duration_since(at).as_secs_f32() * 1000.0);
         }
     }
+}
+
+/// Punto de color para el estado de la conexión. Se dibuja en vez de usar
+/// "●" porque la fuente por defecto no trae ese carácter.
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
 }
 
 /// Color de una tecla encendida: más brillante cuanto más fuerte se tocó.
