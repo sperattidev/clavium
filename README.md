@@ -86,3 +86,14 @@ se pueden sumar otras librerías de samples con licencia libre.
 ```bash
 cargo run -p clavium-app --release -- --instalar-piano estandar
 ```
+
+## Publicar una versión
+
+Al subir una etiqueta `v*` (por ejemplo `v0.1.0`), el flujo `Versión` arma
+`Clavium-windows-x64.zip` y `Clavium-macos-arm64.zip` y crea el release. Se
+puede correr a mano desde Actions para probar sin publicar. La página de
+descarga está en `docs/` para GitHub Pages. Los créditos están en
+[CREDITOS.md](CREDITOS.md).
+
+Pendiente para distribuir sin advertencias: firma de código en Windows y firma
+y notarización en macOS (requieren certificados del desarrollador).

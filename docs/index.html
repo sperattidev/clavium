@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clavium</title>
+  <meta name="description" content="Aprendé piano con tu teclado MIDI: elegí una pieza, tocá y Clavium evalúa cada nota.">
+  <style>
+    :root {
+      --bg: #f6f5f1;
+      --fg: #1d1d22;
+      --muted: #5b5b66;
+      --accent: #1c5696;
+      --card: #ffffff;
+      --line: #dddbd3;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #17171b;
+        --fg: #ecebe6;
+        --muted: #a3a2ab;
+        --accent: #6ec4ff;
+        --card: #212127;
+        --line: #33333a;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 17px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 48px 16px 64px; }
+    h1 { font-size: 44px; margin: 0 0 8px; letter-spacing: -0.02em; }
+    h2 { font-size: 22px; margin: 40px 0 12px; }
+    p { margin: 0 0 12px; }
+    .lead { font-size: 20px; color: var(--muted); }
+    .downloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 28px 0 8px; }
+    .downloads a {
+      display: block; padding: 16px 18px; border-radius: 10px; text-decoration: none;
+      background: var(--accent); color: var(--bg); font-weight: 600;
+    }
+    .downloads a span { display: block; font-weight: 400; font-size: 14px; opacity: 0.85; }
+    .note { font-size: 14px; color: var(--muted); }
+    ul { padding-left: 20px; }
+    li { margin: 6px 0; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+    a { color: var(--accent); }
+    footer { margin-top: 48px; font-size: 14px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Clavium</h1>
+    <p class="lead">Aprendé piano con tu teclado MIDI. Elegí una pieza, tocá mientras las notas caen y Clavium te dice si acertaste, si fallaste o si llegaste tarde.</p>
+
+    <div class="downloads">
+      <a href="https://github.com/sperattidev/clavium/releases/latest">Windows<span>Windows 10 u 11, 64 bits</span></a>
+      <a href="https://github.com/sperattidev/clavium/releases/latest">macOS<span>Apple Silicon (M1 o posterior)</span></a>
+    </div>
+    <p class="note">Gratis y de código abierto. Las primeras versiones todavía no están firmadas: Windows y macOS pueden pedir confirmación la primera vez que la abrís.</p>
+
+    <h2>Qué hace</h2>
+    <ul>
+      <li>Detecta tu teclado MIDI apenas lo conectás y se reconecta solo.</li>
+      <li>Modos espera, ritmo y escucha, práctica por mano, bucles por sección y tempo ajustable.</li>
+      <li>Puntaje, estrellas y los compases que conviene repasar, con tu progreso guardado.</li>
+      <li>Biblioteca por niveles y casi 500 obras completas de dominio público para descargar.</li>
+      <li>Importá tus propios archivos MIDI y elegí qué partes tocar.</li>
+      <li>Piano sintetizado incluido, o un piano de cola Yamaha C5 real con un clic.</li>
+    </ul>
+
+    <h2>Créditos</h2>
+    <div class="card">
+      <p>Piano Yamaha C5: <a href="https://github.com/sfzinstruments/SalamanderGrandPiano">Salamander Grand Piano V3</a> por Alexander Holm (CC BY 3.0).</p>
+      <p>Obras completas: <a href="https://www.mutopiaproject.org">Mutopia Project</a>, con el crédito de cada transcripción en la app.</p>
+    </div>
+
+    <footer>
+      Código en <a href="https://github.com/sperattidev/clavium">GitHub</a> · Licencia MPL-2.0
+    </footer>
+  </main>
+</body>
+</html>

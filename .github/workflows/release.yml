@@ -1,0 +1,89 @@
+name: Versión
+
+# Arma la app para Windows y macOS. Con una etiqueta `v*` además publica el
+# release; a mano (workflow_dispatch) solo deja los archivos para probar.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p clavium-app
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force Clavium | Out-Null
+          Copy-Item target/release/clavium-app.exe Clavium/Clavium.exe
+          Copy-Item LICENSE, README.md, CREDITOS.md Clavium/
+          Compress-Archive -Path Clavium -DestinationPath Clavium-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clavium-windows-x64
+          path: Clavium-windows-x64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p clavium-app
+      - name: Empaquetar Clavium.app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in [0-9]*) ;; *) VERSION="0.0.0" ;; esac
+          APP=Clavium.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/clavium-app "$APP/Contents/MacOS/Clavium"
+          cp LICENSE README.md CREDITOS.md "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Clavium</string>
+            <key>CFBundleDisplayName</key><string>Clavium</string>
+            <key>CFBundleIdentifier</key><string>io.github.sperattidev.clavium</string>
+            <key>CFBundleExecutable</key><string>Clavium</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          ditto -c -k --keepParent "$APP" Clavium-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clavium-macos-arm64
+          path: Clavium-macos-arm64.zip
+
+  publicar:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Crear el release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" Clavium-windows-x64.zip Clavium-macos-arm64.zip \
+            --title "Clavium $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md
