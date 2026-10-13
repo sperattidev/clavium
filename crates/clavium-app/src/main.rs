@@ -31,7 +31,7 @@ use eframe::egui::{
 use calibration::Calibration;
 use clavium_eval::{HandFilter, PracticeMode, Summary};
 use keyboard::{BLACK_LENGTH, KeyboardLayout, KeyboardSize, note_name};
-use library::Library;
+use library::{Filter, GroupBy, Length, Library, Status};
 use live::{KeyState, LatencyStats, LiveKeys};
 use session::{Feedback, PracticeOptions, PracticeRange, Session};
 use store::{PieceStats, SessionRecord, Store};
@@ -48,6 +48,8 @@ const WARN_AMBER: Color32 = Color32::from_rgb(235, 180, 70);
 const FALLBACK_VELOCITY: u8 = 90;
 /// Espera antes de volver a abrir la salida de audio si falló.
 const AUDIO_RETRY: Duration = Duration::from_secs(2);
+/// Alto reservado al pie de la biblioteca.
+const FOOTER_HEIGHT: f32 = 34.0;
 
 fn main() -> eframe::Result {
     // `clavium-app --instalar-catalogo paquete.zip` instala el catálogo sin abrir la ventana.
@@ -145,7 +147,10 @@ struct ClaviumApp {
     /// Desvío medido en la calibración, en milisegundos.
     input_offset_ms: f64,
     library: Library,
-    search: String,
+    filter: Filter,
+    browse_by: GroupBy,
+    /// Nombre con el que se firman las revisiones.
+    reviewer_name: String,
     /// Descarga del catálogo en curso.
     download: Option<Receiver<Result<usize, String>>>,
     /// Aviso para mostrar en la biblioteca (descargas, errores al abrir).
@@ -200,7 +205,9 @@ impl ClaviumApp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
         };
-        let library = Library::load(&catalog::default_dir());
+        let reviewer_name = setting("reviewer_name").unwrap_or_default();
+        let mut library = Library::load(&catalog::default_dir());
+        apply_local_reviews(&mut library, store.as_ref());
         let stats = load_stats(&library, store.as_ref());
 
         let ctx = cc.egui_ctx.clone();
@@ -226,7 +233,13 @@ impl ClaviumApp {
             curve: settings.curve,
             saved: settings,
             library,
-            search: String::new(),
+            filter: Filter {
+                min_level: 1,
+                max_level: 8,
+                ..Default::default()
+            },
+            browse_by: GroupBy::Level,
+            reviewer_name,
             download: None,
             library_message: None,
             screen: Screen::Library,
@@ -381,6 +394,7 @@ impl ClaviumApp {
             .get(self.selected)
             .map(|e| e.id.clone());
         self.library = Library::load(&catalog::default_dir());
+        apply_local_reviews(&mut self.library, self.store.as_ref());
         self.stats = load_stats(&self.library, self.store.as_ref());
         self.selected = selected_id
             .and_then(|id| self.library.entries.iter().position(|e| e.id == id))
@@ -771,18 +785,16 @@ impl ClaviumApp {
             ui.label(RichText::new("Biblioteca").size(26.0).strong());
             ui.add_space(16.0);
             ui.add(
-                egui::TextEdit::singleline(&mut self.search)
+                egui::TextEdit::singleline(&mut self.filter.query)
                     .hint_text("Buscar por título o compositor")
-                    .desired_width(280.0),
+                    .desired_width(260.0),
             );
-            if !self.search.is_empty() && ui.button("Borrar").clicked() {
-                self.search.clear();
+            if !self.filter.query.is_empty() && ui.button("Borrar").clicked() {
+                self.filter.query.clear();
             }
         });
-        ui.label(
-            RichText::new("Elegí una pieza y cómo practicarla.")
-                .color(ui.visuals().weak_text_color()),
-        );
+        ui.add_space(6.0);
+        self.filter_bar(ui);
         ui.add_space(8.0);
 
         let cards: Vec<(String, String, Option<String>, bool)> = self
@@ -791,7 +803,7 @@ impl ClaviumApp {
             .iter()
             .map(|e| {
                 let progress = self.stats.get(&e.id).and_then(progress_text);
-                (e.title.clone(), e.subtitle(), progress, e.draft)
+                (e.title.clone(), e.subtitle(), progress, e.needs_review())
             })
             .collect();
         // Una pieza está dominada si se tocó al tempo original con 90 % o más.
@@ -801,99 +813,280 @@ impl ClaviumApp {
                 .and_then(|s| s.best_speed)
                 .is_some_and(|s| s >= 1.0)
         };
-        let query = self.search.trim().to_string();
-        let groups: Vec<(String, Vec<usize>)> = if query.is_empty() {
-            self.library
-                .groups
-                .iter()
-                .map(|g| {
-                    let header = if g.is_route {
-                        let done = g
-                            .entries
-                            .iter()
-                            .filter(|&&i| mastered(&self.library.entries[i].id))
-                            .count();
-                        format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len())
-                    } else {
-                        format!("{}  ·  {} obras", g.name, g.entries.len())
-                    };
-                    (header, g.entries.clone())
-                })
-                .collect()
-        } else {
-            let found: Vec<usize> = (0..self.library.entries.len())
-                .filter(|&i| self.library.entries[i].matches(&query))
-                .collect();
-            vec![(format!("{} resultados", found.len()), found)]
-        };
+        let browsed = self.library.browse(self.browse_by, &self.filter);
+        let total: usize = browsed.iter().map(|g| g.entries.len()).sum();
+        let filtering = self.filter != self.default_filter();
+        // Con pocos grupos o con un filtro activo se abren todos; si no, solo las rutas.
+        let open_all = filtering || browsed.len() <= 4;
+        let groups: Vec<(String, Vec<usize>, bool)> = browsed
+            .into_iter()
+            .map(|g| {
+                let header = if g.is_route {
+                    let done = g
+                        .entries
+                        .iter()
+                        .filter(|&&i| mastered(&self.library.entries[i].id))
+                        .count();
+                    format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len())
+                } else {
+                    format!("{}  ·  {} obras", g.name, g.entries.len())
+                };
+                (header, g.entries, g.is_route || open_all)
+            })
+            .collect();
         let mut start = false;
-
+        // Las listas dejan lugar al pie, que se dibuja debajo.
+        let list_height = (ui.available_height() - FOOTER_HEIGHT).max(120.0);
         ui.columns(2, |cols| {
             egui::ScrollArea::vertical()
                 .id_salt("pieces")
+                .max_height(list_height)
                 .show(&mut cols[0], |ui| {
-                    for (header, members) in &groups {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(header).strong().color(ACCENT_BRIGHT));
-                        ui.add_space(4.0);
-                        for &i in members {
-                            let (title, subtitle, progress, draft) = &cards[i];
-                            let fill = if i == self.selected {
-                                ACCENT_DIM.gamma_multiply(0.55)
-                            } else {
-                                ui.visuals().faint_bg_color
-                            };
-                            let response = egui::Frame::new()
-                                .inner_margin(12)
-                                .corner_radius(8)
-                                .fill(fill)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(RichText::new(title).size(18.0).strong());
-                                        if *draft {
-                                            ui.label(
-                                                RichText::new("Sin revisar").color(WARN_AMBER),
-                                            )
-                                            .on_hover_text(
-                                                "Nadie la revisó tocándola todavía: puede tener errores de notas.",
-                                            );
+                    if filtering {
+                        ui.label(
+                            RichText::new(format!("{total} piezas con estos filtros"))
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    for (header, members, open) in &groups {
+                        egui::CollapsingHeader::new(
+                            RichText::new(header).strong().color(ACCENT_BRIGHT),
+                        )
+                        .id_salt((header.as_str(), self.browse_by as u8))
+                        .default_open(*open)
+                        .open(filtering.then_some(true))
+                        .show(ui, |ui| {
+                            for &i in members {
+                                let (title, subtitle, progress, draft) = &cards[i];
+                                let fill = if i == self.selected {
+                                    ACCENT_DIM.gamma_multiply(0.55)
+                                } else {
+                                    ui.visuals().faint_bg_color
+                                };
+                                let response = egui::Frame::new()
+                                    .inner_margin(12)
+                                    .corner_radius(8)
+                                    .fill(fill)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new(title).size(18.0).strong());
+                                            if *draft {
+                                                ui.label(
+                                                    RichText::new("Sin revisar")
+                                                        .color(WARN_AMBER),
+                                                )
+                                                .on_hover_text(
+                                                    "Nadie la revisó tocándola todavía: puede tener errores de notas.",
+                                                );
+                                            }
+                                        });
+                                        ui.label(
+                                            RichText::new(subtitle)
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                        if let Some(progress) = progress {
+                                            ui.label(RichText::new(progress).color(OK_GREEN));
                                         }
-                                    });
-                                    ui.label(
-                                        RichText::new(subtitle)
-                                            .color(ui.visuals().weak_text_color()),
-                                    );
-                                    if let Some(progress) = progress {
-                                        ui.label(RichText::new(progress).color(OK_GREEN));
-                                    }
-                                })
-                                .response
-                                .interact(Sense::click());
-                            if response.clicked() && self.selected != i {
-                                self.selected = i;
-                                self.options.section = None;
-                                self.library_message = None;
+                                    })
+                                    .response
+                                    .interact(Sense::click());
+                                if response.clicked() && self.selected != i {
+                                    self.selected = i;
+                                    self.options.section = None;
+                                    self.library_message = None;
+                                }
+                                if response.double_clicked() {
+                                    self.selected = i;
+                                    start = true;
+                                }
+                                ui.add_space(6.0);
                             }
-                            if response.double_clicked() {
-                                self.selected = i;
-                                start = true;
-                            }
-                            ui.add_space(6.0);
-                        }
+                        });
+                    }
+                    if groups.is_empty() {
+                        ui.label("Ninguna pieza cumple estos filtros.");
                     }
 
                     ui.add_space(12.0);
                     self.catalog_panel(ui);
                 });
 
-            let ui = &mut cols[1];
-            if self.practice_options(ui) {
-                start = true;
+            egui::ScrollArea::vertical()
+                .id_salt("options")
+                .max_height(list_height)
+                .show(&mut cols[1], |ui| {
+                    if self.practice_options(ui) {
+                        start = true;
+                    }
+                });
+        });
+        self.library_footer(ui);
+
+        if start {
+            self.start_session();
+        }
+    }
+
+    fn default_filter(&self) -> Filter {
+        Filter {
+            min_level: 1,
+            max_level: 8,
+            ..Default::default()
+        }
+    }
+
+    /// Agrupación y filtros de la biblioteca.
+    fn filter_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Agrupar:");
+            ui.selectable_value(&mut self.browse_by, GroupBy::Level, "Nivel");
+            ui.selectable_value(&mut self.browse_by, GroupBy::Composer, "Compositor");
+            ui.selectable_value(&mut self.browse_by, GroupBy::Style, "Época");
+            ui.separator();
+
+            ui.label("Nivel:");
+            let f = &mut self.filter;
+            egui::ComboBox::from_id_salt("min-level")
+                .width(40.0)
+                .selected_text(f.min_level.to_string())
+                .show_ui(ui, |ui| {
+                    for l in 1..=8u8 {
+                        ui.selectable_value(&mut f.min_level, l, l.to_string());
+                    }
+                });
+            ui.label("a");
+            egui::ComboBox::from_id_salt("max-level")
+                .width(40.0)
+                .selected_text(f.max_level.to_string())
+                .show_ui(ui, |ui| {
+                    for l in 1..=8u8 {
+                        ui.selectable_value(&mut f.max_level, l, l.to_string());
+                    }
+                });
+            if f.min_level > f.max_level {
+                std::mem::swap(&mut f.min_level, &mut f.max_level);
+            }
+            ui.separator();
+
+            ui.label("Duración:");
+            egui::ComboBox::from_id_salt("length")
+                .selected_text(match f.length {
+                    Length::Any => "Cualquiera",
+                    Length::Short => "Menos de 3 min",
+                    Length::Medium => "De 3 a 8 min",
+                    Length::Long => "Más de 8 min",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut f.length, Length::Any, "Cualquiera");
+                    ui.selectable_value(&mut f.length, Length::Short, "Menos de 3 min");
+                    ui.selectable_value(&mut f.length, Length::Medium, "De 3 a 8 min");
+                    ui.selectable_value(&mut f.length, Length::Long, "Más de 8 min");
+                });
+            ui.separator();
+
+            ui.label("Estado:");
+            egui::ComboBox::from_id_salt("status")
+                .selected_text(match f.status {
+                    Status::Any => "Todas",
+                    Status::NotReviewed => "Sin revisar",
+                    Status::Reviewed => "Revisadas",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut f.status, Status::Any, "Todas");
+                    ui.selectable_value(&mut f.status, Status::NotReviewed, "Sin revisar");
+                    ui.selectable_value(&mut f.status, Status::Reviewed, "Revisadas");
+                });
+
+            let default = self.default_filter();
+            if self.filter != default && ui.button("Quitar filtros").clicked() {
+                self.filter = default;
             }
         });
+    }
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+    /// Revisión de la pieza elegida: quien la toca completa y comprueba que
+    /// las notas coinciden con la partitura, la marca como revisada.
+    fn review_box(&mut self, ui: &mut egui::Ui) {
+        let Some(entry) = self.library.entries.get(self.selected) else {
+            return;
+        };
+        if !entry.draft {
+            return; // Ya viene revisada de la fuente.
+        }
+        let id = entry.id.clone();
+        let reviewed = entry.reviewed_here;
+        ui.add_space(12.0);
+        egui::Frame::new()
+            .inner_margin(10)
+            .corner_radius(8)
+            .stroke(Stroke::new(1.0, ui.visuals().weak_text_color()))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if reviewed {
+                    ui.label(RichText::new("Revisaste esta pieza.").color(OK_GREEN));
+                    if ui.small_button("Quitar la revisión").clicked() {
+                        if let Some(store) = &self.store {
+                            store.unmark_reviewed(&id);
+                        }
+                        self.library.entries[self.selected].reviewed_here = false;
+                    }
+                    return;
+                }
+                ui.label(RichText::new("Revisión").strong());
+                ui.label(
+                    RichText::new(
+                        "Si la tocaste completa y las notas coinciden con la partitura, \
+                         marcala como revisada para que deje de figurar como sin revisar.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Tu nombre:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.reviewer_name).desired_width(140.0),
+                    );
+                });
+                let name = self.reviewer_name.trim().to_string();
+                let button =
+                    ui.add_enabled(!name.is_empty(), egui::Button::new("Marcar como revisada"));
+                if button.clicked() {
+                    match &self.store {
+                        Some(store) => {
+                            let _ = store.mark_reviewed(&id, &name);
+                            store.set_setting("reviewer_name", &name);
+                            self.library.entries[self.selected].reviewed_here = true;
+                        }
+                        None => {
+                            self.library_message = Some(
+                                "No se puede guardar la revisión: no hay base de datos.".into(),
+                            );
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Escribe las revisiones de este usuario en el formato de
+    /// `catalog/revisiones.txt`, para sumarlas al catálogo.
+    fn export_reviews(&self) -> Result<PathBuf, String> {
+        let store = self.store.as_ref().ok_or("no hay base de datos")?;
+        let mut text = String::from("# id | revisor | fecha\n");
+        for (id, reviewer, date) in store.reviews() {
+            text.push_str(&format!("{id} | {reviewer} | {date}\n"));
+        }
+        let path = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Clavium")
+            .join("revisiones.txt");
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Pie de la biblioteca: lo que se está tocando y avisos del teclado.
+    fn library_footer(&self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
             ui.add_space(8.0);
             if self.keys.sustain() {
                 ui.label(RichText::new("Pedal presionado").color(ACCENT_BRIGHT));
@@ -921,10 +1114,6 @@ impl ClaviumApp {
                 );
             }
         });
-
-        if start {
-            self.start_session();
-        }
     }
 
     /// Opciones de práctica de la pieza elegida. Devuelve `true` si se apretó Tocar.
@@ -1029,6 +1218,7 @@ impl ClaviumApp {
                 .color(WARN_AMBER),
             );
         }
+        self.review_box(ui);
         if let Some(message) = &self.library_message {
             ui.add_space(8.0);
             ui.label(RichText::new(message).color(WARN_AMBER));
@@ -1523,6 +1713,7 @@ impl ClaviumApp {
 
     fn diagnostics(&mut self, ctx: &egui::Context) {
         let mut open = self.show_diagnostics;
+        let mut exported = None;
         egui::Window::new("Diagnóstico")
             .open(&mut open)
             .default_width(380.0)
@@ -1583,11 +1774,23 @@ impl ClaviumApp {
                     }
                 }
                 ui.separator();
+                ui.heading("Revisiones");
+                ui.label("Exporta las piezas que revisaste, para sumarlas a catalog/revisiones.txt.");
+                if ui.button("Exportar revisiones").clicked() {
+                    exported = Some(self.export_reviews());
+                }
+                ui.separator();
                 ui.heading("Últimos eventos");
                 for line in &self.log {
                     ui.monospace(line);
                 }
             });
+        if let Some(result) = exported {
+            self.library_message = Some(match result {
+                Ok(path) => format!("Revisiones exportadas en {}", path.display()),
+                Err(e) => format!("No se pudieron exportar las revisiones: {e}"),
+            });
+        }
         self.show_diagnostics = open;
     }
 }
@@ -1652,6 +1855,17 @@ impl eframe::App for ClaviumApp {
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);
+}
+
+/// Marca como revisadas las piezas que este usuario ya revisó.
+fn apply_local_reviews(library: &mut Library, store: Option<&Store>) {
+    let Some(store) = store else {
+        return;
+    };
+    let reviewed: Vec<String> = store.reviews().into_iter().map(|(id, _, _)| id).collect();
+    for entry in &mut library.entries {
+        entry.reviewed_here = reviewed.contains(&entry.id);
+    }
 }
 
 fn load_stats(library: &Library, store: Option<&Store>) -> HashMap<String, PieceStats> {

@@ -8,7 +8,7 @@ use clavium_eval::{HandFilter, PracticeMode, Summary};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Versión del esquema de la base. Cada cambio de tablas suma una migración.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Precisión con la que una velocidad cuenta como dominada.
 pub const MASTERED_ACCURACY: f64 = 0.9;
@@ -84,6 +84,15 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS sessions_piece ON sessions (piece);",
             )?;
         }
+        if version < 2 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS reviews (
+                     piece       TEXT PRIMARY KEY,
+                     reviewer    TEXT NOT NULL,
+                     reviewed_at INTEGER NOT NULL
+                 );",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Store { conn })
     }
@@ -109,9 +118,7 @@ impl Store {
 
     pub fn record_session(&self, record: &SessionRecord<'_>) -> rusqlite::Result<()> {
         let s = record.summary;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        let now = unix_now();
         self.conn.execute(
             "INSERT INTO sessions (piece, played_at, mode, hands, speed, section, accuracy,
                                    perfect, good, off_time, missed, wrong, stars)
@@ -133,6 +140,43 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Marca una pieza como revisada: alguien la tocó completa y las notas
+    /// coinciden con la partitura.
+    pub fn mark_reviewed(&self, piece: &str, reviewer: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO reviews (piece, reviewer, reviewed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (piece) DO UPDATE SET reviewer = excluded.reviewer,
+                                               reviewed_at = excluded.reviewed_at",
+            params![piece, reviewer, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unmark_reviewed(&self, piece: &str) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM reviews WHERE piece = ?1", [piece]);
+    }
+
+    /// Revisiones guardadas: (pieza, revisor, fecha AAAA-MM-DD).
+    pub fn reviews(&self) -> Vec<(String, String, String)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT piece, reviewer, reviewed_at FROM reviews ORDER BY piece")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                date(r.get::<_, i64>(2)?),
+            ))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
     }
 
     pub fn piece_stats(&self, piece: &str) -> PieceStats {
@@ -167,6 +211,28 @@ impl Store {
             best_speed,
         }
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Fecha AAAA-MM-DD (UTC) de un instante Unix.
+fn date(unix: i64) -> String {
+    // Algoritmo de días civiles de Howard Hinnant.
+    let days = unix.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn default_path() -> PathBuf {
@@ -253,6 +319,26 @@ mod tests {
         assert_eq!(stats.best_accuracy, Some(0.95));
         assert_eq!(stats.best_speed, Some(0.75));
         assert_eq!(store.piece_stats("otra"), PieceStats::default());
+    }
+
+    #[test]
+    fn reviews_are_saved_and_listed() {
+        let store = Store::open_in_memory().unwrap();
+        store.mark_reviewed("mutopia-x", "Matías").unwrap();
+        store.mark_reviewed("mutopia-x", "Otra persona").unwrap();
+        let reviews = store.reviews();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].1, "Otra persona");
+        assert_eq!(reviews[0].2.len(), 10);
+        store.unmark_reviewed("mutopia-x");
+        assert!(store.reviews().is_empty());
+    }
+
+    #[test]
+    fn dates_are_formatted_in_utc() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(1_791_849_600), "2026-10-13");
+        assert_eq!(date(951_782_400), "2000-02-29");
     }
 
     #[test]

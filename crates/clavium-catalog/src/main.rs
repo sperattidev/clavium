@@ -13,13 +13,15 @@
 mod convert;
 mod mutopia;
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use clavium_core::analysis::{difficulty_score, features, levels_by_rank};
 use clavium_core::catalog::{CatalogEntry, CatalogIndex, INDEX_FILE, SCHEMA_VERSION};
-use clavium_core::{clav, sha256_hex};
+use clavium_core::{Piece, clav, sha256_hex};
 
 const USER_AGENT: &str = "clavium-catalog/0.1 (+https://github.com/sperattidev/clavium)";
 /// Pausa entre pedidos al sitio, para no cargarlo.
@@ -29,7 +31,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [command, repo, out, rest @ ..] = args.as_slice() else {
         eprintln!(
-            "uso: clavium-catalog mutopia <repo de Mutopia> <carpeta de salida> [--cache <carpeta>] [--zip <archivo>] [--limit <n>]"
+            "uso: clavium-catalog mutopia <repo de Mutopia> <carpeta de salida> [--cache <carpeta>] [--zip <archivo>] [--limit <n>] [--niveles <archivo>] [--revisiones <archivo>]"
         );
         return ExitCode::FAILURE;
     };
@@ -46,6 +48,21 @@ fn main() -> ExitCode {
     let out = PathBuf::from(out);
     let cache = option("--cache").map_or_else(|| out.join("cache"), PathBuf::from);
     let limit: Option<usize> = option("--limit").and_then(|v| v.parse().ok());
+    // Por defecto, las correcciones versionadas en el repositorio de Clavium.
+    let default = |name: &str| Some(PathBuf::from("catalog").join(name)).filter(|p| p.exists());
+    let levels = option("--niveles")
+        .map(PathBuf::from)
+        .or_else(|| default("niveles.txt"));
+    let reviews = option("--revisiones")
+        .map(PathBuf::from)
+        .or_else(|| default("revisiones.txt"));
+    let adjustments = match Adjustments::load(levels.as_deref(), reviews.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match run(
         Path::new(repo),
@@ -53,6 +70,7 @@ fn main() -> ExitCode {
         &cache,
         limit,
         option("--zip").map(PathBuf::from),
+        &adjustments,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -138,6 +156,7 @@ fn run(
     cache: &Path,
     limit: Option<usize>,
     zip: Option<PathBuf>,
+    adjustments: &Adjustments,
 ) -> Result<(), String> {
     let mut candidates =
         mutopia::scan(repo).map_err(|e| format!("no se pudo leer {}: {e}", repo.display()))?;
@@ -155,7 +174,7 @@ fn run(
         cache: cache.to_path_buf(),
         last: None,
     };
-    let mut entries = Vec::new();
+    let mut pending: Vec<(CatalogEntry, Piece)> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
 
     for (n, c) in candidates.iter().enumerate() {
@@ -238,25 +257,27 @@ fn run(
             };
             match convert::convert(&midi, &source) {
                 Ok(piece) => {
-                    let mut file = Vec::new();
-                    clav::write(&piece, &mut file).map_err(|e| e.to_string())?;
                     let rel = format!("pieces/{id}.clav");
-                    std::fs::write(out.join(&rel), &file).map_err(|e| e.to_string())?;
-                    entries.push(CatalogEntry {
-                        id,
-                        title: piece_title,
-                        composer: composer.clone(),
-                        opus: c.header.get("opus").cloned().filter(|o| !o.is_empty()),
-                        style: c.field("style").map(str::to_string),
-                        level: piece.metadata.difficulty.unwrap_or(1),
-                        duration_seconds: piece.duration_seconds(),
-                        notes: piece.notes.len(),
-                        license: license.clone(),
-                        attribution: maintainer.clone(),
-                        source_url: c.page_url(),
-                        file: rel,
-                        sha256: sha256_hex(&file),
-                    });
+                    pending.push((
+                        CatalogEntry {
+                            id,
+                            title: piece_title,
+                            composer: composer.clone(),
+                            opus: c.header.get("opus").cloned().filter(|o| !o.is_empty()),
+                            style: c.field("style").map(str::to_string),
+                            level: piece.metadata.difficulty.unwrap_or(1),
+                            duration_seconds: piece.duration_seconds(),
+                            notes: piece.notes.len(),
+                            license: license.clone(),
+                            attribution: maintainer.clone(),
+                            source_url: c.page_url(),
+                            file: rel,
+                            sha256: String::new(),
+                            reviewed: false,
+                            composer_key: c.field("composer").map(str::to_string),
+                        },
+                        piece,
+                    ));
                     converted += 1;
                 }
                 Err(e) => skipped.push((piece_title, e)),
@@ -265,6 +286,8 @@ fn run(
         println!("{converted} pieza(s)");
     }
 
+    let entries = finalize(pending, out, adjustments)?;
+    let mut entries = entries;
     entries.sort_by(|a, b| {
         (
             a.level,
@@ -296,6 +319,102 @@ fn run(
         println!("Paquete: {}", zip.display());
     }
     Ok(())
+}
+
+/// Correcciones a mano que se versionan en el repositorio, en `catalog/`.
+#[derive(Debug, Default)]
+struct Adjustments {
+    /// Nivel elegido a mano para obras que la estimación ubica mal.
+    levels: HashMap<String, u8>,
+    /// Quién revisó cada obra tocándola completa.
+    reviews: HashMap<String, Vec<String>>,
+}
+
+impl Adjustments {
+    /// `niveles.txt`: líneas `id = nivel`. `revisiones.txt`: líneas
+    /// `id | revisor | fecha`. Las líneas que empiezan con `#` son comentarios.
+    fn load(levels: Option<&Path>, reviews: Option<&Path>) -> Result<Self, String> {
+        let read = |path: Option<&Path>| -> Result<String, String> {
+            match path {
+                Some(p) => std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display())),
+                None => Ok(String::new()),
+            }
+        };
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+        let mut adjustments = Adjustments::default();
+        for line in lines(&read(levels)?) {
+            let (id, level) = line
+                .split_once('=')
+                .ok_or_else(|| format!("niveles: línea inválida `{line}`"))?;
+            let level: u8 = level
+                .trim()
+                .parse()
+                .ok()
+                .filter(|l| (1..=8).contains(l))
+                .ok_or_else(|| format!("niveles: nivel inválido en `{line}`"))?;
+            adjustments.levels.insert(id.trim().to_string(), level);
+        }
+        for line in lines(&read(reviews)?) {
+            let parts: Vec<&str> = line.split('|').map(str::trim).collect();
+            let [id, reviewer, date] = parts.as_slice() else {
+                return Err(format!("revisiones: línea inválida `{line}`"));
+            };
+            adjustments
+                .reviews
+                .entry(id.to_string())
+                .or_default()
+                .push(format!("{reviewer}, {date}"));
+        }
+        Ok(adjustments)
+    }
+}
+
+/// Reparte los niveles por posición, aplica las correcciones a mano y
+/// escribe cada `.clav`.
+fn finalize(
+    pending: Vec<(CatalogEntry, Piece)>,
+    out: &Path,
+    adjustments: &Adjustments,
+) -> Result<Vec<CatalogEntry>, String> {
+    let scores: Vec<f64> = pending
+        .iter()
+        .map(|(_, piece)| difficulty_score(&features(piece)))
+        .collect();
+    let levels = levels_by_rank(&scores);
+    let mut entries = Vec::with_capacity(pending.len());
+    for ((mut entry, mut piece), level) in pending.into_iter().zip(levels) {
+        let level = adjustments.levels.get(&entry.id).copied().unwrap_or(level);
+        piece.metadata.difficulty = Some(level);
+        if let (Some(reviewers), Some(provenance)) = (
+            adjustments.reviews.get(&entry.id),
+            piece.provenance.as_mut(),
+        ) {
+            provenance.reviewers = reviewers.clone();
+            entry.reviewed = true;
+        }
+        let mut file = Vec::new();
+        clav::write(&piece, &mut file).map_err(|e| e.to_string())?;
+        std::fs::write(out.join(&entry.file), &file).map_err(|e| e.to_string())?;
+        entry.level = level;
+        entry.sha256 = sha256_hex(&file);
+        entries.push(entry);
+    }
+    let unknown: Vec<&String> = adjustments
+        .levels
+        .keys()
+        .chain(adjustments.reviews.keys())
+        .filter(|id| !entries.iter().any(|e| &e.id == *id))
+        .collect();
+    if !unknown.is_empty() {
+        println!("Aviso: hay ajustes para obras que no están en el catálogo: {unknown:?}");
+    }
+    Ok(entries)
 }
 
 fn unzip_midis(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -370,6 +489,38 @@ mod tests {
         );
         assert_eq!(clean_composer("Scott Joplin"), "Scott Joplin");
         assert_eq!(clean_composer("J. S. Bach (attr.)"), "J. S. Bach (attr.)");
+    }
+
+    #[test]
+    fn reads_level_and_review_adjustments() {
+        let dir = std::env::temp_dir().join(format!("clavium-adj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let levels = dir.join("niveles.txt");
+        let reviews = dir.join("revisiones.txt");
+        std::fs::write(
+            &levels,
+            "# comentario
+mutopia-x = 3
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &reviews,
+            "mutopia-x | Matías | 2026-10-13
+",
+        )
+        .unwrap();
+        let a = Adjustments::load(Some(&levels), Some(&reviews)).unwrap();
+        assert_eq!(a.levels["mutopia-x"], 3);
+        assert_eq!(a.reviews["mutopia-x"], vec!["Matías, 2026-10-13"]);
+        std::fs::write(
+            &levels,
+            "mutopia-x = 9
+",
+        )
+        .unwrap();
+        assert!(Adjustments::load(Some(&levels), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

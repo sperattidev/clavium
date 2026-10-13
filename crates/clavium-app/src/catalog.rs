@@ -123,6 +123,7 @@ mod tests {
                 id: "x".into(),
                 title: "X".into(),
                 composer: None,
+                composer_key: None,
                 opus: None,
                 style: None,
                 level: 1,
@@ -133,6 +134,7 @@ mod tests {
                 source_url: "https://example.com".into(),
                 file: "pieces/x.clav".into(),
                 sha256: sha256_hex(&clav),
+                reviewed: false,
             }],
         };
         let mut buf = Vec::new();

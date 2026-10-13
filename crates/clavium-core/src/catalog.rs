@@ -23,6 +23,10 @@ pub struct CatalogEntry {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer: Option<String>,
+    /// Clave estable del compositor en la fuente (por ejemplo "BachJS"), para
+    /// agrupar aunque el nombre esté escrito de formas distintas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,9 @@ pub struct CatalogEntry {
     pub file: String,
     /// SHA-256 del `.clav`, para verificar la descarga.
     pub sha256: String,
+    /// Si alguien la revisó tocándola completa.
+    #[serde(default)]
+    pub reviewed: bool,
 }
 
 impl CatalogEntry {
@@ -68,6 +75,7 @@ mod tests {
                 id: "mutopia-bachjs-bwv846".into(),
                 title: "Preludio en Do".into(),
                 composer: Some("J. S. Bach".into()),
+                composer_key: Some("BachJS".into()),
                 opus: Some("BWV 846".into()),
                 style: None,
                 level: 4,
@@ -78,6 +86,7 @@ mod tests {
                 source_url: "https://www.mutopiaproject.org/".into(),
                 file: "pieces/mutopia-bachjs-bwv846.clav".into(),
                 sha256: "00".into(),
+                reviewed: false,
             }],
         };
         let json = serde_json::to_string(&index).unwrap();

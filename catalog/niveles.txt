@@ -1,0 +1,7 @@
+# Niveles elegidos a mano para obras que la estimación automática ubica mal.
+# Formato: id = nivel (1 a 8). El id es el de catalog/index.json del paquete.
+
+# Muy rítmica y con muchas notas simultáneas, pero de dificultad media.
+mutopia-joplins-entertainer = 6
+# Rápida y corta: el puntaje la sobreestima. Estudio de nivel intermedio.
+mutopia-burgmullerjff-o100-25ef-02 = 4

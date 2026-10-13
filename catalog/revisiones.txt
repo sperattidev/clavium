@@ -1,0 +1,4 @@
+# Obras del catálogo revisadas tocándolas completas.
+# Formato: id | revisor | fecha (AAAA-MM-DD)
+# La app guarda las revisiones de cada usuario y las exporta en este formato
+# para sumarlas acá (Diagnóstico → Exportar revisiones).
