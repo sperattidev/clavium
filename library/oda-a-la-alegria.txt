@@ -1,0 +1,18 @@
+# Arreglo simplificado propio de Clavium sobre el tema de la Sinfonía n.º 9.
+title: Oda a la alegría
+composer: Ludwig van Beethoven
+arranger: Clavium
+difficulty: 1
+arrangement: simplified
+tempo: 100
+time: 4/4
+source: Arreglo propio de Clavium sobre una obra de dominio público
+license: Propia (Clavium)
+section: Frase A 1-4
+section: Frase A' 5-8
+
+right: E4:1 E4 F4 G4 | G4 F4 E4 D4 | C4 C4 D4 E4 | E4:1.5 D4:0.5 D4:2
+right: E4:1 E4 F4 G4 | G4 F4 E4 D4 | C4 C4 D4 E4 | D4:1.5 C4:0.5 C4:2
+
+left: C3:4 | G2:4 | C3:4 | G2:4
+left: C3:4 | G2:4 | C3:2 G2 | G2:2 C3

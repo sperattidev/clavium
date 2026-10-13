@@ -426,3 +426,28 @@ fn clav_rejects_newer_schema_versions() {
         Err(ClavError::UnsupportedVersion { .. })
     ));
 }
+
+// --- Biblioteca inicial ---
+
+#[test]
+fn bundled_library_pieces_parse_and_validate() {
+    let pieces = [
+        include_str!("../../../library/estrellita.txt"),
+        include_str!("../../../library/oda-a-la-alegria.txt"),
+        include_str!("../../../library/minueto-en-sol.txt"),
+    ];
+    for text in pieces {
+        let piece = clavium_core::notation::parse_piece(text).unwrap();
+        let issues = validate(&piece);
+        assert!(issues.is_empty(), "{}: {issues:?}", piece.metadata.title);
+        assert!(piece.notes.iter().any(|n| n.hand == Hand::Left));
+        assert!(piece.notes.iter().any(|n| n.hand == Hand::Right));
+        let last_section = piece.sections.last().unwrap();
+        assert_eq!(
+            last_section.end_tick,
+            piece.end_tick(),
+            "{}",
+            piece.metadata.title
+        );
+    }
+}

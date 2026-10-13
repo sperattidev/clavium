@@ -312,6 +312,8 @@ name = "clavium-app"
 version = "0.1.0"
 dependencies = [
  "clavium-audio",
+ "clavium-core",
+ "clavium-eval",
  "clavium-midi",
  "eframe",
 ]
@@ -335,6 +337,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "clavium-eval"
+version = "0.1.0"
+dependencies = [
+ "clavium-core",
 ]
 
 [[package]]

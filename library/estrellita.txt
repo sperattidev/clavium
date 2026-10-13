@@ -1,0 +1,21 @@
+# Arreglo simplificado propio de Clavium sobre una melodía tradicional.
+title: Estrellita
+composer: Tradicional
+arranger: Clavium
+difficulty: 1
+arrangement: simplified
+tempo: 90
+time: 4/4
+source: Arreglo propio de Clavium sobre una melodía de dominio público
+license: Propia (Clavium)
+section: Frase A 1-4
+section: Frase B 5-8
+section: Frase A 9-12
+
+right: C4:1 C4 G4 G4 | A4 A4 G4:2 | F4:1 F4 E4 E4 | D4 D4 C4:2
+right: G4:1 G4 F4 F4 | E4 E4 D4:2 | G4:1 G4 F4 F4 | E4 E4 D4:2
+right: C4:1 C4 G4 G4 | A4 A4 G4:2 | F4:1 F4 E4 E4 | D4 D4 C4:2
+
+left: C3:4 | F3:2 C3 | F3:2 C3 | G2:2 C3
+left: C3:2 F3 | C3:2 G2 | C3:2 F3 | C3:2 G2
+left: C3:4 | F3:2 C3 | F3:2 C3 | G2:2 C3

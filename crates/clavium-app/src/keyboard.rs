@@ -160,6 +160,25 @@ impl KeyboardLayout {
         (self.lowest..=self.highest).contains(&pitch)
     }
 
+    /// La tecla de `pitch`, si está en el teclado.
+    pub fn key(&self, pitch: u8) -> Option<&KeyShape> {
+        if !self.contains(pitch) {
+            return None;
+        }
+        self.keys.iter().find(|k| k.pitch == pitch)
+    }
+
+    /// El corrimiento más cercano al actual que deja todo el rango
+    /// `low..=high` dentro del teclado, o `None` si no entra.
+    pub fn shift_to_fit(&self, low: u8, high: u8) -> Option<i8> {
+        let current = self.octave_shift;
+        (0..=8i8)
+            .flat_map(|d| [current + d, current - d])
+            .filter_map(|s| KeyboardLayout::with_shift(self.size, s))
+            .find(|l| l.contains(low) && l.contains(high))
+            .map(|l| l.octave_shift)
+    }
+
     /// Tecla bajo un punto: `x` en anchos de tecla blanca desde el borde
     /// izquierdo, `depth` de 0 (fondo del teclado) a 1 (borde delantero).
     pub fn key_at(&self, x: f32, depth: f32) -> Option<u8> {

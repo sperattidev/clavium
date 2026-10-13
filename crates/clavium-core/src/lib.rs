@@ -7,6 +7,7 @@
 pub mod clav;
 pub mod midi;
 pub mod model;
+pub mod notation;
 pub mod tempo;
 pub mod validate;
 

@@ -1,0 +1,19 @@
+# Arreglo simplificado propio de Clavium del Minueto en Sol mayor,
+# atribuido a Christian Petzold (BWV Anh. 114). Primeros 8 compases.
+title: Minueto en Sol
+composer: Christian Petzold
+arranger: Clavium
+difficulty: 2
+arrangement: simplified
+tempo: 108
+time: 3/4
+source: Arreglo propio de Clavium sobre una obra de dominio público
+license: Propia (Clavium)
+section: Primera frase 1-4
+section: Segunda frase 5-8
+
+right: D5:1 G4:0.5 A4 B4 C5 | D5:1 G4 G4 | E5:1 C5:0.5 D5 E5 F#5 | G5:1 G4 G4
+right: C5:1 D5:0.5 C5 B4 A4 | B4:1 C5:0.5 B4 A4 G4 | F#4:1 G4:0.5 A4 B4 G4 | A4:3
+
+left: G3+B3:2 A3:1 | B3:3 | C4:3 | B3:3
+left: A3:3 | G3:3 | D4:1 B3 G3 | D4:1 D3:2
