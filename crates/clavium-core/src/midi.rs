@@ -159,6 +159,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
     });
     piece.time_signatures = time_signatures;
     piece.notes = notes.into_iter().map(|(_, n)| n).collect();
+    resolve_overlaps(&mut piece.notes);
     piece.sustain = sustain;
     piece.sort_notes();
     Ok(piece)
@@ -175,9 +176,11 @@ fn note(pitch: u8, velocity: u8, start_tick: u64, end_tick: u64) -> Note {
     }
 }
 
-/// Si exactamente dos pistas tienen notas, la de altura media más aguda es la
-/// mano derecha (la convención habitual de los MIDI de piano). En otro caso
-/// se divide por altura en el Do central.
+/// Con dos o más pistas, se ordenan por altura media y se parten en dos
+/// grupos por el salto más grande entre medias consecutivas: el grupo agudo
+/// es la mano derecha. Así funciona tanto con una pista por mano como con
+/// una pista por voz (lo que generan muchos editores de partituras). Con una
+/// sola pista se divide por altura en el Do central.
 fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
     let mut by_track: HashMap<usize, (u64, u64)> = HashMap::new(); // pista -> (suma de alturas, cantidad)
     for (track, n) in notes.iter() {
@@ -186,15 +189,22 @@ fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
         entry.1 += 1;
     }
 
-    if by_track.len() == 2 {
+    if by_track.len() >= 2 {
         let mut tracks: Vec<(usize, f64)> = by_track
             .into_iter()
             .map(|(t, (sum, count))| (t, sum as f64 / count as f64))
             .collect();
         tracks.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let left_track = tracks[0].0;
+        let split = (1..tracks.len())
+            .max_by(|&a, &b| {
+                let gap_a = tracks[a].1 - tracks[a - 1].1;
+                let gap_b = tracks[b].1 - tracks[b - 1].1;
+                gap_a.total_cmp(&gap_b)
+            })
+            .expect("hay al menos dos pistas");
+        let left: Vec<usize> = tracks[..split].iter().map(|(t, _)| *t).collect();
         for (track, n) in notes.iter_mut() {
-            n.hand = if *track == left_track {
+            n.hand = if left.contains(track) {
                 Hand::Left
             } else {
                 Hand::Right
@@ -205,6 +215,27 @@ fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
             n.hand = hand_by_split(n.pitch, DEFAULT_HAND_SPLIT);
         }
     }
+}
+
+/// Dos notas de la misma altura no pueden sonar a la vez en un piano. Pasa
+/// en MIDI de partituras cuando dos voces comparten una nota: la primera se
+/// corta donde empieza la segunda, y si empiezan juntas queda la más larga.
+pub fn resolve_overlaps(notes: &mut Vec<Note>) {
+    notes.sort_by_key(|n| (n.pitch, n.start_tick, std::cmp::Reverse(n.end_tick)));
+    let mut kept: Vec<Note> = Vec::with_capacity(notes.len());
+    for n in notes.drain(..) {
+        if let Some(prev) = kept.last_mut()
+            && prev.pitch == n.pitch
+            && n.start_tick < prev.end_tick
+        {
+            if n.start_tick == prev.start_tick {
+                continue; // la anterior es igual o más larga
+            }
+            prev.end_tick = n.start_tick;
+        }
+        kept.push(n);
+    }
+    *notes = kept;
 }
 
 /// Mano que corresponde a una altura si se divide el teclado en `split`.

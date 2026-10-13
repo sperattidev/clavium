@@ -22,6 +22,7 @@ crates/
   clavium-midi/   detección del teclado, reconexión y entrada en vivo
   clavium-eval/   motor de evaluación: aciertos, errores, modos de práctica y puntaje
   clavium-audio/  piano interno y salida de audio
+  clavium-catalog/ arma el paquete de obras completas desde el Mutopia Project
   clavium-app/    la app: biblioteca, notas que caen, evaluación y resultados
 library/         piezas de la biblioteca inicial
 ```
@@ -51,3 +52,19 @@ El código está bajo la [Mozilla Public License 2.0](LICENSE). Las
 contribuciones externas requieren aceptar un acuerdo de contribución (CLA),
 que se publicará antes de abrir el proyecto a colaboradores. El nombre y el
 logo de Clavium no están cubiertos por la licencia del código.
+
+## Biblioteca ampliada
+
+Las obras completas se descargan aparte de la app. El paquete se arma con
+`clavium-catalog` a partir del [Mutopia Project](https://www.mutopiaproject.org):
+solo obras para teclado solo con licencia de dominio público o Creative
+Commons Attribution (las ShareAlike quedan afuera). Cada obra lleva su ficha de
+procedencia y entra como "sin revisar" hasta que alguien la toca completa.
+
+```bash
+git clone --depth 1 https://github.com/MutopiaProject/MutopiaProject.git
+```
+
+```bash
+cargo run -p clavium-catalog --release -- mutopia MutopiaProject catalogo --zip clavium-catalog.zip
+```

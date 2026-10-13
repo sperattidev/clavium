@@ -1,0 +1,13 @@
+[package]
+name = "clavium-catalog"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clavium-core = { version = "0.1.0", path = "../clavium-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3.4.2"
+zip = "9.0.2"

@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod calibration;
+mod catalog;
 mod falling;
 mod keyboard;
 mod library;
@@ -14,6 +15,8 @@ mod session;
 mod store;
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use clavium_audio::{AudioEngine, Command};
@@ -116,11 +119,16 @@ enum Screen {
 struct ClaviumApp {
     store: Option<Store>,
     /// Estadísticas por pieza, leídas de la base.
-    stats: HashMap<&'static str, PieceStats>,
+    stats: HashMap<String, PieceStats>,
     saved: Settings,
     /// Desvío medido en la calibración, en milisegundos.
     input_offset_ms: f64,
     library: Library,
+    search: String,
+    /// Descarga del catálogo en curso.
+    download: Option<Receiver<Result<usize, String>>>,
+    /// Aviso para mostrar en la biblioteca (descargas, errores al abrir).
+    library_message: Option<String>,
     screen: Screen,
     selected: usize,
     options: PlayOptions,
@@ -171,18 +179,8 @@ impl ClaviumApp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
         };
-        let library = Library::bundled();
-        let stats = library
-            .entries
-            .iter()
-            .map(|e| {
-                let stats = store
-                    .as_ref()
-                    .map(|s| s.piece_stats(e.id))
-                    .unwrap_or_default();
-                (e.id, stats)
-            })
-            .collect();
+        let library = Library::load(&catalog::default_dir());
+        let stats = load_stats(&library, store.as_ref());
 
         let ctx = cc.egui_ctx.clone();
         let midi_config = ServiceConfig {
@@ -207,6 +205,9 @@ impl ClaviumApp {
             curve: settings.curve,
             saved: settings,
             library,
+            search: String::new(),
+            download: None,
+            library_message: None,
             screen: Screen::Library,
             selected: 0,
             options: PlayOptions::default(),
@@ -277,10 +278,16 @@ impl ClaviumApp {
     }
 
     fn start_session(&mut self) {
-        let Some(entry) = self.library.entries.get(self.selected) else {
+        let Some(entry) = self.library.entries.get_mut(self.selected) else {
             return;
         };
-        let piece = &entry.piece;
+        let piece = match entry.piece() {
+            Ok(piece) => piece,
+            Err(e) => {
+                self.library_message = Some(format!("No se pudo abrir la pieza: {e}"));
+                return;
+            }
+        };
         let range = self
             .options
             .section
@@ -344,6 +351,57 @@ impl ClaviumApp {
         self.screen = Screen::Playing(Box::new(Session::new(piece, options)));
     }
 
+    /// Vuelve a leer la biblioteca (por ejemplo, después de instalar el
+    /// catálogo) manteniendo la pieza elegida.
+    fn reload_library(&mut self) {
+        let selected_id = self
+            .library
+            .entries
+            .get(self.selected)
+            .map(|e| e.id.clone());
+        self.library = Library::load(&catalog::default_dir());
+        self.stats = load_stats(&self.library, self.store.as_ref());
+        self.selected = selected_id
+            .and_then(|id| self.library.entries.iter().position(|e| e.id == id))
+            .unwrap_or(0);
+    }
+
+    /// Termina una descarga del catálogo o instala un paquete arrastrado.
+    fn update_catalog(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.download
+            && let Ok(result) = rx.try_recv()
+        {
+            self.download = None;
+            self.finish_install(result);
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("zip")))
+                .collect()
+        });
+        if let Some(path) = dropped.first() {
+            let result = std::fs::read(path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| catalog::install_zip(&bytes, &catalog::default_dir()));
+            self.finish_install(result);
+        }
+    }
+
+    fn finish_install(&mut self, result: Result<usize, String>) {
+        match result {
+            Ok(count) => {
+                self.reload_library();
+                self.library_message = Some(format!("Se instalaron {count} obras completas."));
+            }
+            Err(e) => {
+                self.library_message = Some(format!("No se pudo instalar el catálogo: {e}"));
+            }
+        }
+    }
+
     fn update_calibration(&mut self) {
         let Screen::Calibration(calibration) = &mut self.screen else {
             return;
@@ -353,14 +411,19 @@ impl ClaviumApp {
     }
 
     fn record(&mut self, session: &Session, summary: &Summary) {
-        let Some(entry) = self.library.entries.get(self.selected) else {
+        let Some(id) = self
+            .library
+            .entries
+            .get(self.selected)
+            .map(|e| e.id.clone())
+        else {
             return;
         };
         if session.mode == PracticeMode::Listen {
             return;
         }
         let record = SessionRecord {
-            piece: entry.id,
+            piece: &id,
             mode: session.mode,
             hands: session.hands,
             speed: session.speed,
@@ -370,11 +433,11 @@ impl ClaviumApp {
         match &self.store {
             Some(store) => {
                 let _ = store.record_session(&record);
-                self.stats.insert(entry.id, store.piece_stats(entry.id));
+                self.stats.insert(id.clone(), store.piece_stats(&id));
             }
             None => {
                 // Sin base, se lleva la cuenta solo mientras la app está abierta.
-                let stats = self.stats.entry(entry.id).or_default();
+                let stats = self.stats.entry(id.clone()).or_default();
                 stats.sessions += 1;
                 let counts = session.mode == PracticeMode::Rhythm
                     && session.hands == HandFilter::Both
@@ -677,43 +740,37 @@ impl ClaviumApp {
     }
 
     fn library_screen(&mut self, ui: &mut egui::Ui) {
+        // La pieza elegida se lee al elegirla, para mostrar sus secciones.
+        if let Some(entry) = self.library.entries.get_mut(self.selected) {
+            let _ = entry.piece();
+        }
+
         ui.add_space(12.0);
-        ui.label(RichText::new("Biblioteca").size(26.0).strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Biblioteca").size(26.0).strong());
+            ui.add_space(16.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Buscar por título o compositor")
+                    .desired_width(280.0),
+            );
+            if !self.search.is_empty() && ui.button("Borrar").clicked() {
+                self.search.clear();
+            }
+        });
         ui.label(
             RichText::new("Elegí una pieza y cómo practicarla.")
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         let cards: Vec<(String, String, Option<String>, bool)> = self
             .library
             .entries
             .iter()
             .map(|e| {
-                let progress = self.stats.get(e.id).and_then(|s| {
-                    let mut parts = Vec::new();
-                    if let Some(best) = s.best_accuracy {
-                        parts.push(format!("Mejor: {:.0} %", best * 100.0));
-                    }
-                    if let Some(speed) = s.best_speed {
-                        parts.push(format!("Dominada al {:.0} %", speed * 100.0));
-                    }
-                    if s.sessions > 0 {
-                        let plural = if s.sessions == 1 {
-                            "sesión"
-                        } else {
-                            "sesiones"
-                        };
-                        parts.push(format!("{} {plural}", s.sessions));
-                    }
-                    (!parts.is_empty()).then(|| parts.join(" · "))
-                });
-                (
-                    e.piece.metadata.title.clone(),
-                    e.subtitle(),
-                    progress,
-                    e.is_draft(),
-                )
+                let progress = self.stats.get(&e.id).and_then(progress_text);
+                (e.title.clone(), e.subtitle(), progress, e.draft)
             })
             .collect();
         // Una pieza está dominada si se tocó al tempo original con 90 % o más.
@@ -723,165 +780,95 @@ impl ClaviumApp {
                 .and_then(|s| s.best_speed)
                 .is_some_and(|s| s >= 1.0)
         };
-        let groups: Vec<(String, Vec<usize>)> = self
-            .library
-            .groups
-            .iter()
-            .map(|g| {
-                let done = g
-                    .entries
-                    .iter()
-                    .filter(|&&i| mastered(self.library.entries[i].id))
-                    .count();
-                let header = format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len());
-                (header, g.entries.clone())
-            })
-            .collect();
+        let query = self.search.trim().to_string();
+        let groups: Vec<(String, Vec<usize>)> = if query.is_empty() {
+            self.library
+                .groups
+                .iter()
+                .map(|g| {
+                    let header = if g.is_route {
+                        let done = g
+                            .entries
+                            .iter()
+                            .filter(|&&i| mastered(&self.library.entries[i].id))
+                            .count();
+                        format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len())
+                    } else {
+                        format!("{}  ·  {} obras", g.name, g.entries.len())
+                    };
+                    (header, g.entries.clone())
+                })
+                .collect()
+        } else {
+            let found: Vec<usize> = (0..self.library.entries.len())
+                .filter(|&i| self.library.entries[i].matches(&query))
+                .collect();
+            vec![(format!("{} resultados", found.len()), found)]
+        };
         let mut start = false;
 
         ui.columns(2, |cols| {
             egui::ScrollArea::vertical()
                 .id_salt("pieces")
                 .show(&mut cols[0], |ui| {
-                    for (i, header) in groups.iter().flat_map(|(header, entries)| {
-                        entries
-                            .iter()
-                            .enumerate()
-                            .map(move |(k, &i)| (i, (k == 0).then_some(header)))
-                    }) {
-                        if let Some(header) = header {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(header).strong().color(ACCENT_BRIGHT));
-                            ui.add_space(4.0);
-                        }
-                        let (title, subtitle, progress, draft) = &cards[i];
-                        let selected = i == self.selected;
-                        let fill = if selected {
-                            ACCENT_DIM.gamma_multiply(0.55)
-                        } else {
-                            ui.visuals().faint_bg_color
-                        };
-                        let response = egui::Frame::new()
-                            .inner_margin(12)
-                            .corner_radius(8)
-                            .fill(fill)
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(title).size(19.0).strong());
-                                    if *draft {
-                                        ui.label(RichText::new("Borrador").color(WARN_AMBER))
-                                            .on_hover_text("Arreglo sin revisar: puede tener errores de notas.");
+                    for (header, members) in &groups {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(header).strong().color(ACCENT_BRIGHT));
+                        ui.add_space(4.0);
+                        for &i in members {
+                            let (title, subtitle, progress, draft) = &cards[i];
+                            let fill = if i == self.selected {
+                                ACCENT_DIM.gamma_multiply(0.55)
+                            } else {
+                                ui.visuals().faint_bg_color
+                            };
+                            let response = egui::Frame::new()
+                                .inner_margin(12)
+                                .corner_radius(8)
+                                .fill(fill)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(title).size(18.0).strong());
+                                        if *draft {
+                                            ui.label(
+                                                RichText::new("Sin revisar").color(WARN_AMBER),
+                                            )
+                                            .on_hover_text(
+                                                "Nadie la revisó tocándola todavía: puede tener errores de notas.",
+                                            );
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(subtitle)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                    if let Some(progress) = progress {
+                                        ui.label(RichText::new(progress).color(OK_GREEN));
                                     }
-                                });
-                                ui.label(
-                                    RichText::new(subtitle).color(ui.visuals().weak_text_color()),
-                                );
-                                if let Some(progress) = progress {
-                                    ui.label(RichText::new(progress).color(OK_GREEN));
-                                }
-                            })
-                            .response
-                            .interact(Sense::click());
-                        if response.clicked() && self.selected != i {
-                            self.selected = i;
-                            self.options.section = None;
+                                })
+                                .response
+                                .interact(Sense::click());
+                            if response.clicked() && self.selected != i {
+                                self.selected = i;
+                                self.options.section = None;
+                                self.library_message = None;
+                            }
+                            if response.double_clicked() {
+                                self.selected = i;
+                                start = true;
+                            }
+                            ui.add_space(6.0);
                         }
-                        if response.double_clicked() {
-                            self.selected = i;
-                            start = true;
-                        }
-                        ui.add_space(8.0);
                     }
+
+                    ui.add_space(12.0);
+                    self.catalog_panel(ui);
                 });
 
             let ui = &mut cols[1];
-            ui.label(RichText::new("Mano").strong());
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.options.hands, HandFilter::Both, "Ambas");
-                ui.selectable_value(&mut self.options.hands, HandFilter::Right, "Derecha");
-                ui.selectable_value(&mut self.options.hands, HandFilter::Left, "Izquierda");
-            });
-            ui.add_space(10.0);
-            ui.label(RichText::new("Modo").strong());
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.options.mode, PracticeMode::Wait, "Espera");
-                ui.selectable_value(&mut self.options.mode, PracticeMode::Rhythm, "Ritmo");
-                ui.selectable_value(&mut self.options.mode, PracticeMode::Listen, "Escucha");
-            });
-            ui.label(
-                RichText::new(match self.options.mode {
-                    PracticeMode::Wait => {
-                        "La música se detiene hasta que tocás las notas correctas."
-                    }
-                    PracticeMode::Rhythm => "La música avanza sola y se evalúa si llegás a tiempo.",
-                    PracticeMode::Listen => "Clavium toca la pieza y vos mirás.",
-                })
-                .color(ui.visuals().weak_text_color()),
-            );
-            ui.add_space(10.0);
-            ui.label(RichText::new("Velocidad").strong());
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.options.speed, 0.5, "50 %");
-                ui.selectable_value(&mut self.options.speed, 0.75, "75 %");
-                ui.selectable_value(&mut self.options.speed, 1.0, "100 %");
-            });
-            ui.add_space(10.0);
-
-            let sections: Vec<String> = self
-                .library
-                .entries
-                .get(self.selected)
-                .map(|e| e.piece.sections.iter().map(|s| s.name.clone()).collect())
-                .unwrap_or_default();
-            if !sections.is_empty() {
-                ui.label(RichText::new("Qué practicar").strong());
-                let current = self
-                    .options
-                    .section
-                    .and_then(|i| sections.get(i).cloned())
-                    .unwrap_or_else(|| "La pieza completa".to_string());
-                egui::ComboBox::from_id_salt("section")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.options.section, None, "La pieza completa");
-                        for (i, name) in sections.iter().enumerate() {
-                            ui.selectable_value(&mut self.options.section, Some(i), name);
-                        }
-                    });
-                if self.options.section.is_some() {
-                    ui.checkbox(&mut self.options.looping, "Repetir en bucle");
-                    ui.add_enabled(
-                        self.options.looping,
-                        egui::Checkbox::new(
-                            &mut self.options.speed_up,
-                            "Subir el tempo 5 % por vuelta si pasás el 90 %",
-                        ),
-                    );
-                }
-            }
-            ui.add_space(16.0);
-            let tocar = ui.add_sized(
-                [180.0, 44.0],
-                egui::Button::new(RichText::new("Tocar").size(20.0)),
-            );
-            if tocar.clicked() {
+            if self.practice_options(ui) {
                 start = true;
-            }
-            if let Some(entry) = self.library.entries.get(self.selected)
-                && self
-                    .layout
-                    .shift_to_fit(entry.lowest, entry.highest)
-                    .is_none()
-            {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "Esta pieza usa notas que no entran en un teclado de {}.",
-                        self.size.label()
-                    ))
-                    .color(WARN_AMBER),
-                );
             }
         });
 
@@ -917,6 +904,162 @@ impl ClaviumApp {
         if start {
             self.start_session();
         }
+    }
+
+    /// Opciones de práctica de la pieza elegida. Devuelve `true` si se apretó Tocar.
+    fn practice_options(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut start = false;
+        if let Some(entry) = self.library.entries.get(self.selected) {
+            ui.label(RichText::new(&entry.title).size(20.0).strong());
+            if let Some(credit) = &entry.credit {
+                ui.label(
+                    RichText::new(credit)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            ui.add_space(8.0);
+        }
+        ui.label(RichText::new("Mano").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.options.hands, HandFilter::Both, "Ambas");
+            ui.selectable_value(&mut self.options.hands, HandFilter::Right, "Derecha");
+            ui.selectable_value(&mut self.options.hands, HandFilter::Left, "Izquierda");
+        });
+        ui.add_space(10.0);
+        ui.label(RichText::new("Modo").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.options.mode, PracticeMode::Wait, "Espera");
+            ui.selectable_value(&mut self.options.mode, PracticeMode::Rhythm, "Ritmo");
+            ui.selectable_value(&mut self.options.mode, PracticeMode::Listen, "Escucha");
+        });
+        ui.label(
+            RichText::new(match self.options.mode {
+                PracticeMode::Wait => "La música se detiene hasta que tocás las notas correctas.",
+                PracticeMode::Rhythm => "La música avanza sola y se evalúa si llegás a tiempo.",
+                PracticeMode::Listen => "Clavium toca la pieza y vos mirás.",
+            })
+            .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(10.0);
+        ui.label(RichText::new("Velocidad").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.options.speed, 0.5, "50 %");
+            ui.selectable_value(&mut self.options.speed, 0.75, "75 %");
+            ui.selectable_value(&mut self.options.speed, 1.0, "100 %");
+        });
+        ui.add_space(10.0);
+
+        let sections: Vec<String> = self
+            .library
+            .entries
+            .get(self.selected)
+            .and_then(|e| e.loaded())
+            .map(|p| p.sections.iter().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        if !sections.is_empty() {
+            ui.label(RichText::new("Qué practicar").strong());
+            let current = self
+                .options
+                .section
+                .and_then(|i| sections.get(i).cloned())
+                .unwrap_or_else(|| "La pieza completa".to_string());
+            egui::ComboBox::from_id_salt("section")
+                .selected_text(current)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.options.section, None, "La pieza completa");
+                    for (i, name) in sections.iter().enumerate() {
+                        ui.selectable_value(&mut self.options.section, Some(i), name);
+                    }
+                });
+            if self.options.section.is_some() {
+                ui.checkbox(&mut self.options.looping, "Repetir en bucle");
+                ui.add_enabled(
+                    self.options.looping,
+                    egui::Checkbox::new(
+                        &mut self.options.speed_up,
+                        "Subir el tempo 5 % por vuelta si pasás el 90 %",
+                    ),
+                );
+            }
+        }
+        ui.add_space(16.0);
+        let tocar = ui.add_sized(
+            [180.0, 44.0],
+            egui::Button::new(RichText::new("Tocar").size(20.0)),
+        );
+        if tocar.clicked() {
+            start = true;
+        }
+        if let Some((low, high)) = self
+            .library
+            .entries
+            .get(self.selected)
+            .and_then(|e| e.range())
+            && self.layout.shift_to_fit(low, high).is_none()
+        {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "Esta pieza usa notas que no entran en un teclado de {}.",
+                    self.size.label()
+                ))
+                .color(WARN_AMBER),
+            );
+        }
+        if let Some(message) = &self.library_message {
+            ui.add_space(8.0);
+            ui.label(RichText::new(message).color(WARN_AMBER));
+        }
+        start
+    }
+
+    /// Estado de la biblioteca ampliada: descargarla o ver cuántas obras tiene.
+    fn catalog_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .inner_margin(12)
+            .corner_radius(8)
+            .stroke(Stroke::new(1.0, ui.visuals().weak_text_color()))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Biblioteca ampliada").strong());
+                if self.download.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Descargando obras completas…");
+                    });
+                    return;
+                }
+                let text = if self.library.catalog_size > 0 {
+                    format!(
+                        "{} obras completas de dominio público o CC BY, del Mutopia Project.",
+                        self.library.catalog_size
+                    )
+                } else {
+                    "Cientos de obras completas de dominio público o CC BY, del Mutopia Project. \
+                     Se descargan aparte."
+                        .to_string()
+                };
+                ui.label(RichText::new(text).color(ui.visuals().weak_text_color()));
+                let label = if self.library.catalog_size > 0 {
+                    "Actualizar"
+                } else {
+                    "Descargar"
+                };
+                if ui.button(label).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.download = Some(catalog::download_in_background(
+                        catalog::default_dir(),
+                        move || ctx.request_repaint(),
+                    ));
+                }
+                ui.label(
+                    RichText::new("También podés arrastrar un paquete .zip a la ventana.")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
     }
 
     fn playing_screen(&mut self, ui: &mut egui::Ui) {
@@ -1435,6 +1578,7 @@ impl eframe::App for ClaviumApp {
         self.update_audio();
         self.update_session();
         self.update_calibration();
+        self.update_catalog(ctx);
         if matches!(self.screen, Screen::Playing(_) | Screen::Calibration(_)) {
             // Las notas caen: hay que dibujar todos los cuadros.
             ctx.request_repaint();
@@ -1487,6 +1631,37 @@ impl eframe::App for ClaviumApp {
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);
+}
+
+fn load_stats(library: &Library, store: Option<&Store>) -> HashMap<String, PieceStats> {
+    library
+        .entries
+        .iter()
+        .map(|e| {
+            let stats = store.map(|s| s.piece_stats(&e.id)).unwrap_or_default();
+            (e.id.clone(), stats)
+        })
+        .collect()
+}
+
+/// Resumen del progreso de una pieza para su tarjeta en la biblioteca.
+fn progress_text(stats: &PieceStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(best) = stats.best_accuracy {
+        parts.push(format!("Mejor: {:.0} %", best * 100.0));
+    }
+    if let Some(speed) = stats.best_speed {
+        parts.push(format!("Dominada al {:.0} %", speed * 100.0));
+    }
+    if stats.sessions > 0 {
+        let plural = if stats.sessions == 1 {
+            "sesión"
+        } else {
+            "sesiones"
+        };
+        parts.push(format!("{} {plural}", stats.sessions));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn curve_key(curve: VelocityCurve) -> &'static str {

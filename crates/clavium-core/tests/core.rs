@@ -456,3 +456,56 @@ fn bundled_library_pieces_parse_and_validate() {
     }
     assert!(count >= 3, "se esperaban al menos 3 piezas en library/");
 }
+
+#[test]
+fn import_resolves_overlapping_notes_of_the_same_pitch() {
+    // Dos voces en pistas distintas comparten un Do4.
+    let bytes = smf_bytes(
+        Format::Parallel,
+        480,
+        vec![
+            vec![on(0, 60, 80), off(960, 60), end()],
+            vec![
+                on(0, 60, 70),
+                off(480, 60),
+                on(0, 60, 70),
+                off(480, 60),
+                end(),
+            ],
+            vec![on(0, 36, 70), off(960, 36), end()],
+        ],
+    );
+    let piece = import_smf(&bytes).unwrap();
+    let c4: Vec<_> = piece
+        .notes
+        .iter()
+        .filter(|n| n.pitch == 60)
+        .map(|n| (n.start_tick, n.end_tick))
+        .collect();
+    assert_eq!(c4, vec![(0, 480), (480, 960)]);
+    assert!(validate(&piece).is_empty());
+}
+
+#[test]
+fn import_groups_voice_tracks_into_two_hands() {
+    // Cuatro pistas, una por voz: soprano, contralto, tenor y bajo.
+    let bytes = smf_bytes(
+        Format::Parallel,
+        480,
+        vec![
+            vec![on(0, 76, 80), off(480, 76), end()],
+            vec![on(0, 67, 80), off(480, 67), end()],
+            vec![on(0, 48, 80), off(480, 48), end()],
+            vec![on(0, 36, 80), off(480, 36), end()],
+        ],
+    );
+    let piece = import_smf(&bytes).unwrap();
+    for n in &piece.notes {
+        let expected = if n.pitch >= 60 {
+            Hand::Right
+        } else {
+            Hand::Left
+        };
+        assert_eq!(n.hand, expected, "nota {}", n.pitch);
+    }
+}
