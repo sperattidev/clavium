@@ -8,6 +8,7 @@
 mod calibration;
 mod catalog;
 mod falling;
+mod instruments;
 mod keyboard;
 mod library;
 mod live;
@@ -16,10 +17,11 @@ mod store;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use clavium_audio::{AudioEngine, Command};
+use clavium_audio::{AudioEngine, Command, SampleBank};
 use clavium_midi::{
     KeyEvent, MidiEvent, MidiService, PortKind, ServiceConfig, VelocityCurve, classify_port,
 };
@@ -30,6 +32,7 @@ use eframe::egui::{
 
 use calibration::Calibration;
 use clavium_eval::{HandFilter, PracticeMode, Summary};
+use instruments::{Quality, SALAMANDER};
 use keyboard::{BLACK_LENGTH, KeyboardLayout, KeyboardSize, note_name};
 use library::{Filter, GroupBy, Length, Library, Status};
 use live::{KeyState, LatencyStats, LiveKeys};
@@ -68,6 +71,41 @@ fn main() -> eframe::Result {
             Err(e) => {
                 eprintln!("No se pudo instalar el catálogo: {e}");
                 std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    // `clavium-app --instalar-piano [estandar|completa]` descarga el Yamaha C5 sin abrir la ventana.
+    if let Some(flag) = args.first()
+        && flag == "--instalar-piano"
+    {
+        let quality = match args.get(1).map(String::as_str) {
+            Some("completa") => Quality::Full,
+            _ => Quality::Standard,
+        };
+        let rx = instruments::prepare_in_background(&SALAMANDER, quality, true, || {});
+        let mut last = String::new();
+        for event in rx {
+            match event {
+                instruments::Event::Progress(p) => {
+                    let line = format!("{p:?}");
+                    if line != last {
+                        println!("{line}");
+                        last = line;
+                    }
+                }
+                instruments::Event::Ready(bank) => {
+                    println!(
+                        "Listo: {} ({:.0} MB en memoria)",
+                        bank.name,
+                        bank.memory_bytes() as f64 / 1e6
+                    );
+                    return Ok(());
+                }
+                instruments::Event::Failed(e) => {
+                    eprintln!("No se pudo instalar el piano: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         return Ok(());
@@ -127,6 +165,11 @@ struct Settings {
     volume: f32,
     sound_on: bool,
     input_offset_ms: f64,
+    /// Piano de samples elegido, o `None` para el sintetizado.
+    sampled: bool,
+    quality: Quality,
+    /// Si el usuario descartó la recomendación de bajar el Yamaha C5.
+    prompt_dismissed: bool,
 }
 
 enum Screen {
@@ -140,6 +183,16 @@ enum Screen {
 }
 
 struct ClaviumApp {
+    /// Piano de samples elegido (si es `false`, suena el sintetizado).
+    sampled: bool,
+    quality: Quality,
+    prompt_dismissed: bool,
+    /// Descarga o carga del piano de samples en curso.
+    piano_job: Option<Receiver<instruments::Event>>,
+    piano_progress: Option<instruments::Progress>,
+    /// Piano de samples cargado, para volver a dárselo al audio si se reabre.
+    piano_bank: Option<Arc<SampleBank>>,
+    piano_error: Option<String>,
     store: Option<Store>,
     /// Estadísticas por pieza, leídas de la base.
     stats: HashMap<String, PieceStats>,
@@ -204,6 +257,11 @@ impl ClaviumApp {
             input_offset_ms: setting("input_offset_ms")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
+            sampled: setting("instrument").is_some_and(|v| v == SALAMANDER.id),
+            quality: setting("instrument_quality")
+                .and_then(|v| Quality::from_key(&v))
+                .unwrap_or(Quality::Standard),
+            prompt_dismissed: setting("salamander_prompt").is_some_and(|v| v == "dismissed"),
         };
         let reviewer_name = setting("reviewer_name").unwrap_or_default();
         let mut library = Library::load(&catalog::default_dir());
@@ -224,10 +282,18 @@ impl ClaviumApp {
             }
             Err(e) => (None, Some(e.to_string())),
         };
-        ClaviumApp {
+        let mut app = ClaviumApp {
             store,
             stats,
             input_offset_ms: settings.input_offset_ms,
+            // Solo se usa el piano de samples si ya está descargado.
+            sampled: settings.sampled && instruments::installed(&SALAMANDER).is_some(),
+            quality: settings.quality,
+            prompt_dismissed: settings.prompt_dismissed,
+            piano_job: None,
+            piano_progress: None,
+            piano_bank: None,
+            piano_error: None,
             sound_on: settings.sound_on,
             volume: settings.volume,
             curve: settings.curve,
@@ -263,6 +329,65 @@ impl ClaviumApp {
             show_diagnostics: false,
             log: VecDeque::new(),
             started: Instant::now(),
+        };
+        if app.sampled {
+            app.start_piano(&cc.egui_ctx, false);
+        }
+        app
+    }
+
+    /// Descarga (si `download`) y carga el Yamaha C5 en segundo plano.
+    fn start_piano(&mut self, ctx: &egui::Context, download: bool) {
+        if self.piano_job.is_some() {
+            return;
+        }
+        self.piano_error = None;
+        self.piano_progress = None;
+        let ctx = ctx.clone();
+        self.piano_job = Some(instruments::prepare_in_background(
+            &SALAMANDER,
+            self.quality,
+            download,
+            move || ctx.request_repaint(),
+        ));
+    }
+
+    /// Recibe los avances de la descarga o la carga del piano de samples.
+    fn update_piano(&mut self) {
+        let Some(rx) = &self.piano_job else {
+            return;
+        };
+        let mut finished = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                instruments::Event::Progress(p) => self.piano_progress = Some(p),
+                instruments::Event::Ready(bank) => {
+                    if let Some(audio) = &mut self.audio {
+                        audio.set_instrument(Some(bank.clone()));
+                    }
+                    self.piano_bank = Some(bank);
+                    self.sampled = true;
+                    finished = true;
+                }
+                instruments::Event::Failed(e) => {
+                    self.piano_error = Some(e);
+                    self.sampled = false;
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.piano_job = None;
+            self.piano_progress = None;
+        }
+    }
+
+    /// Vuelve al piano sintetizado y libera la memoria del de samples.
+    fn use_synth(&mut self) {
+        self.sampled = false;
+        self.piano_bank = None;
+        if let Some(audio) = &mut self.audio {
+            audio.set_instrument(None);
         }
     }
 
@@ -494,6 +619,9 @@ impl ClaviumApp {
             volume: self.volume,
             sound_on: self.sound_on,
             input_offset_ms: self.input_offset_ms,
+            sampled: self.sampled,
+            quality: self.quality,
+            prompt_dismissed: self.prompt_dismissed,
         };
         if current == self.saved {
             return;
@@ -504,6 +632,18 @@ impl ClaviumApp {
             store.set_setting("volume", current.volume);
             store.set_setting("sound_on", current.sound_on);
             store.set_setting("input_offset_ms", current.input_offset_ms);
+            store.set_setting(
+                "instrument",
+                if current.sampled {
+                    SALAMANDER.id
+                } else {
+                    "synth"
+                },
+            );
+            store.set_setting("instrument_quality", current.quality.key());
+            if current.prompt_dismissed {
+                store.set_setting("salamander_prompt", "dismissed");
+            }
         }
         self.saved = current;
     }
@@ -560,6 +700,7 @@ impl ClaviumApp {
 
     fn update_audio(&mut self) {
         if let Some(audio) = &mut self.audio {
+            audio.release_retired();
             for ms in audio.drain_latencies() {
                 self.sound_latency.record(ms);
             }
@@ -570,8 +711,11 @@ impl ClaviumApp {
             }
         } else if self.audio_retry_at.is_some_and(|t| Instant::now() >= t) {
             match AudioEngine::start() {
-                Ok(engine) => {
+                Ok(mut engine) => {
                     engine.set_volume(self.volume);
+                    if let Some(bank) = &self.piano_bank {
+                        engine.set_instrument(Some(bank.clone()));
+                    }
                     self.audio = Some(engine);
                     self.audio_error = None;
                     self.audio_retry_at = None;
@@ -766,12 +910,114 @@ impl ClaviumApp {
                     if toggle.changed() && !self.sound_on {
                         self.send_audio(Command::AllNotesOff);
                     }
+                    ui.separator();
+                    self.piano_selector(ui);
                 } else {
                     ui.label(RichText::new("Sin salida de audio").color(WARN_AMBER))
                         .on_hover_text(self.audio_error.clone().unwrap_or_default());
                 }
             });
         });
+    }
+
+    /// Qué piano suena: el sintetizado o el Yamaha C5 de samples.
+    fn piano_selector(&mut self, ui: &mut egui::Ui) {
+        if let Some(progress) = &self.piano_progress {
+            let text = match progress {
+                instruments::Progress::Downloading { done, total } => {
+                    format!("Descargando Yamaha C5: {done} de {total}")
+                }
+                instruments::Progress::Loading { done, total } => {
+                    format!("Cargando Yamaha C5: {} %", done * 100 / (*total).max(1))
+                }
+            };
+            ui.label(text);
+            ui.spinner();
+            return;
+        }
+        let installed = instruments::installed(&SALAMANDER).is_some();
+        let current = if self.sampled {
+            "Yamaha C5"
+        } else {
+            "Sintetizado"
+        };
+        let mut choice = self.sampled;
+        egui::ComboBox::from_id_salt("piano")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, false, "Sintetizado");
+                let label = if installed {
+                    "Yamaha C5 (Salamander)"
+                } else {
+                    "Yamaha C5 (Salamander): descargar"
+                };
+                ui.selectable_value(&mut choice, true, label)
+                    .on_hover_text(SALAMANDER.credit);
+            })
+            .response
+            .on_hover_text(if self.sampled {
+                SALAMANDER.credit
+            } else {
+                "Piano generado por Clavium, sin descargas."
+            });
+        ui.label("Piano:");
+        if choice != self.sampled {
+            if choice {
+                let ctx = ui.ctx().clone();
+                self.start_piano(&ctx, !installed);
+            } else {
+                self.use_synth();
+            }
+        }
+    }
+
+    /// Recomendación de bajar el Yamaha C5, hasta que se baje o se descarte.
+    fn piano_banner(&mut self, ui: &mut egui::Ui) {
+        if self.prompt_dismissed
+            || self.sampled
+            || self.piano_job.is_some()
+            || instruments::installed(&SALAMANDER).is_some()
+        {
+            if let Some(error) = &self.piano_error {
+                ui.label(
+                    RichText::new(format!("No se pudo preparar el Yamaha C5: {error}"))
+                        .color(WARN_AMBER),
+                );
+            }
+            return;
+        }
+        egui::Frame::new()
+            .inner_margin(12)
+            .corner_radius(8)
+            .fill(ACCENT_DIM.gamma_multiply(0.35))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Recomendado: sonido de piano real").strong());
+                    ui.label(format!(
+                        "{} Reemplaza al piano sintetizado y se descarga una sola vez (unos 400 MB).",
+                        SALAMANDER.description
+                    ));
+                });
+                ui.label(
+                    RichText::new(SALAMANDER.credit)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if let Some(error) = &self.piano_error {
+                    ui.label(RichText::new(error).color(WARN_AMBER));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Descargar el Yamaha C5").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.start_piano(&ctx, true);
+                    }
+                    if ui.button("Ahora no").clicked() {
+                        self.prompt_dismissed = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
     }
 
     fn library_screen(&mut self, ui: &mut egui::Ui) {
@@ -794,6 +1040,7 @@ impl ClaviumApp {
             }
         });
         ui.add_space(6.0);
+        self.piano_banner(ui);
         self.filter_bar(ui);
         ui.add_space(8.0);
 
@@ -1714,6 +1961,7 @@ impl ClaviumApp {
     fn diagnostics(&mut self, ctx: &egui::Context) {
         let mut open = self.show_diagnostics;
         let mut exported = None;
+        let mut quality_change = None;
         egui::Window::new("Diagnóstico")
             .open(&mut open)
             .default_width(380.0)
@@ -1774,6 +2022,25 @@ impl ClaviumApp {
                     }
                 }
                 ui.separator();
+                ui.heading("Créditos");
+                ui.label(SALAMANDER.credit);
+                if let Some(bank) = &self.piano_bank {
+                    ui.label(format!(
+                        "Piano cargado: {} ({:.0} MB en memoria, calidad {}).",
+                        bank.name,
+                        bank.memory_bytes() as f64 / 1e6,
+                        self.quality.label()
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Calidad del Yamaha C5:");
+                    for q in [Quality::Standard, Quality::Full] {
+                        if ui.selectable_label(self.quality == q, q.label()).clicked() && self.quality != q {
+                            quality_change = Some(q);
+                        }
+                    }
+                });
+                ui.separator();
                 ui.heading("Revisiones");
                 ui.label("Exporta las piezas que revisaste, para sumarlas a catalog/revisiones.txt.");
                 if ui.button("Exportar revisiones").clicked() {
@@ -1785,6 +2052,14 @@ impl ClaviumApp {
                     ui.monospace(line);
                 }
             });
+        if let Some(q) = quality_change {
+            self.quality = q;
+            if self.sampled {
+                // Con la calidad nueva hay que bajar (o dejar de usar) capas.
+                self.use_synth();
+                self.start_piano(ctx, true);
+            }
+        }
         if let Some(result) = exported {
             self.library_message = Some(match result {
                 Ok(path) => format!("Revisiones exportadas en {}", path.display()),
@@ -1800,6 +2075,7 @@ impl eframe::App for ClaviumApp {
         self.handle_midi();
         self.handle_computer_keyboard(ctx);
         self.update_audio();
+        self.update_piano();
         self.update_session();
         self.update_calibration();
         self.update_catalog(ctx);

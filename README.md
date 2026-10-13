@@ -68,3 +68,21 @@ git clone --depth 1 https://github.com/MutopiaProject/MutopiaProject.git
 ```bash
 cargo run -p clavium-catalog --release -- mutopia MutopiaProject catalogo --zip clavium-catalog.zip
 ```
+
+## Sonido
+
+Clavium suena con un piano sintetizado propio, sin descargas. Desde la app se
+puede descargar con un clic un piano de samples real, que se instala en la
+carpeta de datos del usuario:
+
+- **Yamaha C5 (Salamander Grand Piano V3)**, por Alexander Holm, con la
+  afinación "Retuned" de Markus Fiedler y la versión SFZ de
+  [sfzinstruments](https://github.com/sfzinstruments/SalamanderGrandPiano)
+  (kinwie). Licencia Creative Commons Attribution 3.0.
+
+`clavium-audio` incluye un lector de instrumentos SFZ y un sampler, así que
+se pueden sumar otras librerías de samples con licencia libre.
+
+```bash
+cargo run -p clavium-app --release -- --instalar-piano estandar
+```

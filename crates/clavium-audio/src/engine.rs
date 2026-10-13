@@ -9,11 +9,14 @@ use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, Stream, StreamConfig, SupportedBufferSize};
 
+use crate::sampler::{SampleBank, Sampler};
 use crate::synth::PianoSynth;
 
 /// Buffer pedido a la placa: 256 muestras a 48 kHz son unos 5,3 ms.
 const PREFERRED_BUFFER: u32 = 256;
 const COMMAND_QUEUE: usize = 1024;
+/// Los samples están grabados cerca del máximo; con muchas notas juntas saturan.
+const SAMPLER_GAIN: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
@@ -46,6 +49,10 @@ pub struct OutputInfo {
 pub struct AudioEngine {
     _stream: Stream,
     commands: rtrb::Producer<(Command, Instant)>,
+    /// Cambios de instrumento: `None` vuelve al piano sintetizado.
+    instruments: rtrb::Producer<Option<Sampler>>,
+    /// Instrumentos reemplazados, para liberarlos fuera del hilo de audio.
+    retired: rtrb::Consumer<Sampler>,
     latencies: rtrb::Consumer<f32>,
     volume: Arc<AtomicU32>,
     failed: Arc<AtomicBool>,
@@ -92,7 +99,10 @@ impl AudioEngine {
         let volume = Arc::new(AtomicU32::new(0.8f32.to_bits()));
         let failed = Arc::new(AtomicBool::new(false));
 
+        let (instruments, mut instrument_rx) = rtrb::RingBuffer::<Option<Sampler>>::new(4);
+        let (mut retired_tx, retired) = rtrb::RingBuffer::<Sampler>::new(4);
         let mut synth = PianoSynth::new(config.sample_rate);
+        let mut sampler: Option<Sampler> = None;
         let channels = usize::from(config.channels.max(1));
         let callback_volume = volume.clone();
         let error_flag = failed.clone();
@@ -104,22 +114,53 @@ impl AudioEngine {
                     let timestamp = info.timestamp();
                     let output_delay = timestamp.playback.duration_since(timestamp.callback);
                     let now = Instant::now();
+                    while let Ok(next) = instrument_rx.pop() {
+                        synth.all_notes_off();
+                        if let Some(old) = std::mem::replace(&mut sampler, next) {
+                            // Se libera en el hilo de la app, no acá.
+                            let _ = retired_tx.push(old);
+                        }
+                    }
                     while let Ok((command, at)) = command_rx.pop() {
-                        match command {
-                            Command::NoteOn { pitch, velocity } => {
-                                synth.note_on(pitch, velocity);
+                        match (command, sampler.as_mut()) {
+                            (Command::NoteOn { pitch, velocity }, s) => {
+                                match s {
+                                    Some(s) => s.note_on(pitch, velocity),
+                                    None => synth.note_on(pitch, velocity),
+                                }
                                 let total = now.saturating_duration_since(at) + output_delay;
                                 let _ = latency_tx.push(total.as_secs_f32() * 1000.0);
                             }
-                            Command::NoteOff { pitch } => synth.note_off(pitch),
-                            Command::Sustain(down) => synth.set_sustain(down),
-                            Command::AllNotesOff => synth.all_notes_off(),
+                            (Command::NoteOff { pitch }, Some(s)) => s.note_off(pitch),
+                            (Command::NoteOff { pitch }, None) => synth.note_off(pitch),
+                            (Command::Sustain(down), Some(s)) => s.set_sustain(down),
+                            (Command::Sustain(down), None) => synth.set_sustain(down),
+                            (Command::AllNotesOff, Some(s)) => s.all_notes_off(),
+                            (Command::AllNotesOff, None) => synth.all_notes_off(),
                         }
                     }
                     let volume = f32::from_bits(callback_volume.load(Ordering::Relaxed));
                     for frame in data.chunks_mut(channels) {
-                        let s = soft_clip(synth.next_sample() * volume);
-                        frame.fill(s);
+                        let (l, r) = match sampler.as_mut() {
+                            Some(s) => {
+                                let (l, r) = s.next_frame();
+                                (l * SAMPLER_GAIN, r * SAMPLER_GAIN)
+                            }
+                            None => {
+                                let m = synth.next_sample();
+                                (m, m)
+                            }
+                        };
+                        let (l, r) = (soft_clip(l * volume), soft_clip(r * volume));
+                        match frame {
+                            [mono] => *mono = (l + r) * 0.5,
+                            [left, right, rest @ ..] => {
+                                *left = l;
+                                *right = r;
+                                rest.fill((l + r) * 0.5);
+                            }
+                            [] => {}
+                        }
                     }
                 },
                 move |_err| error_flag.store(true, Ordering::Relaxed),
@@ -133,11 +174,27 @@ impl AudioEngine {
         Ok(AudioEngine {
             _stream: stream,
             commands,
+            instruments,
+            retired,
             latencies,
             volume,
             failed,
             info,
         })
+    }
+
+    /// Cambia el instrumento: un banco de samples, o `None` para volver al
+    /// piano sintetizado. Las notas que sonaban se cortan.
+    pub fn set_instrument(&mut self, bank: Option<Arc<SampleBank>>) {
+        let sampler = bank.map(|b| Sampler::new(b, self.info.sample_rate));
+        let _ = self.instruments.push(sampler);
+    }
+
+    /// Libera los instrumentos que el hilo de audio dejó de usar.
+    pub fn release_retired(&mut self) {
+        while let Ok(old) = self.retired.pop() {
+            drop(old);
+        }
     }
 
     pub fn send(&mut self, command: Command) {
