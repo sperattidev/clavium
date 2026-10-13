@@ -102,6 +102,19 @@ impl Fetcher {
     }
 }
 
+/// "Frederik Kuhlau (1786-1832)" → "Frederik Kuhlau": las fechas no ayudan a buscar.
+fn clean_composer(name: &str) -> String {
+    let trimmed = match name.rfind('(') {
+        Some(i)
+            if name.trim_end().ends_with(')') && name[i..].chars().any(|c| c.is_ascii_digit()) =>
+        {
+            &name[..i]
+        }
+        _ => name,
+    };
+    trimmed.trim().trim_end_matches(',').trim().to_string()
+}
+
 fn slug(text: &str) -> String {
     let mut s: String = text
         .chars()
@@ -201,7 +214,7 @@ fn run(
             vec![(None, bytes)]
         };
 
-        let composer = c.header.get("composer").cloned();
+        let composer = c.header.get("composer").map(|c| clean_composer(c));
         let maintainer = rdf
             .maintainer
             .clone()
@@ -343,4 +356,24 @@ fn write_zip(out: &Path, index: &CatalogIndex, zip_path: &Path) -> Result<(), St
     }
     zip.finish().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_names_lose_their_dates() {
+        assert_eq!(
+            clean_composer("Frederik Kuhlau (1786-1832)"),
+            "Frederik Kuhlau"
+        );
+        assert_eq!(clean_composer("Scott Joplin"), "Scott Joplin");
+        assert_eq!(clean_composer("J. S. Bach (attr.)"), "J. S. Bach (attr.)");
+    }
+
+    #[test]
+    fn slugs_are_safe_file_names() {
+        assert_eq!(slug("BachJS/BWV846/bwv-846"), "bachjs-bwv846-bwv-846");
+    }
 }

@@ -50,6 +50,27 @@ const FALLBACK_VELOCITY: u8 = 90;
 const AUDIO_RETRY: Duration = Duration::from_secs(2);
 
 fn main() -> eframe::Result {
+    // `clavium-app --instalar-catalogo paquete.zip` instala el catálogo sin abrir la ventana.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, path] = args.as_slice()
+        && flag == "--instalar-catalogo"
+    {
+        let result = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| catalog::install_zip(&bytes, &catalog::default_dir()));
+        match result {
+            Ok(count) => println!(
+                "Se instalaron {count} obras en {}",
+                catalog::default_dir().display()
+            ),
+            Err(e) => {
+                eprintln!("No se pudo instalar el catálogo: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Clavium")
