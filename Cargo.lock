@@ -354,6 +354,7 @@ dependencies = [
  "clavium-midi",
  "dirs",
  "eframe",
+ "hound",
  "midly",
  "rfd",
  "rusqlite",

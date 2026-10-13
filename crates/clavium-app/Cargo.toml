@@ -19,4 +19,5 @@ ureq = "3.4.2"
 zip = "9.0.2"
 
 [dev-dependencies]
+hound = "3.5.1"
 midly = "0.5.3"

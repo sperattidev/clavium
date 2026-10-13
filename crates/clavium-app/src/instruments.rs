@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use clavium_audio::SampleBank;
-use clavium_audio::sfz::{self, SfzError, SfzInstrument};
+use clavium_audio::sfz::{self, SfzError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
@@ -53,6 +53,7 @@ impl Quality {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct SampledPiano {
     pub id: &'static str,
     pub name: &'static str,
@@ -106,10 +107,31 @@ pub enum Event {
     Failed(String),
 }
 
+/// De dónde sale el piano de samples.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// Uno de los que Clavium sabe descargar.
+    Download(&'static SampledPiano),
+    /// Un `.sfz` que el usuario ya tiene en su computadora.
+    Custom(PathBuf),
+}
+
+impl Source {
+    pub fn name(&self) -> String {
+        match self {
+            Source::Download(piano) => piano.name.to_string(),
+            Source::Custom(path) => path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Librería propia".to_string()),
+        }
+    }
+}
+
 /// Descarga (si hace falta) y carga el piano en un hilo aparte. Los avances
 /// y el resultado llegan por el canal; `wake` pide redibujar la ventana.
 pub fn prepare_in_background(
-    piano: &'static SampledPiano,
+    source: Source,
     quality: Quality,
     download: bool,
     wake: impl Fn() + Send + 'static,
@@ -121,13 +143,19 @@ pub fn prepare_in_background(
             wake();
         };
         let result = (|| {
-            let dir = dir(piano);
-            if download {
-                install(piano, quality, &dir, &tx, &wake)?;
+            let instrument = match &source {
+                Source::Download(piano) => {
+                    let dir = dir(piano);
+                    if download {
+                        install(piano, quality, &dir, &tx, &wake)?;
+                    }
+                    sfz::load(&dir.join(piano.sfz_file)).map_err(|e| e.to_string())?
+                }
+                Source::Custom(path) => sfz::load(path).map_err(|e| e.to_string())?,
             }
-            let instrument = open(piano, &dir, quality)?;
+            .with_velocity_layers(quality.layers());
             let bank = SampleBank::load(
-                piano.name,
+                &source.name(),
                 &instrument,
                 quality.max_seconds(),
                 &|done, total| {
@@ -145,11 +173,6 @@ pub fn prepare_in_background(
         });
     });
     rx
-}
-
-fn open(piano: &SampledPiano, dir: &Path, quality: Quality) -> Result<SfzInstrument, String> {
-    let instrument = sfz::load(&dir.join(piano.sfz_file)).map_err(|e| e.to_string())?;
-    Ok(instrument.with_velocity_layers(quality.layers()))
 }
 
 /// Baja el `.sfz`, los archivos que incluye y los samples de la calidad
@@ -253,6 +276,50 @@ mod tests {
             encode("Salamander Grand Piano V3.sfz"),
             "Salamander%20Grand%20Piano%20V3.sfz"
         );
+    }
+
+    #[test]
+    fn a_custom_sfz_library_loads_from_disk() {
+        let dir = std::env::temp_dir().join(format!("clavium-sfz-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("samples")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav = hound::WavWriter::create(dir.join("samples/c4.wav"), spec).unwrap();
+        for i in 0..44_100 {
+            let s = (i as f32 * 261.6 * std::f32::consts::TAU / 44_100.0).sin();
+            wav.write_sample((s * 12_000.0) as i16).unwrap();
+        }
+        wav.finalize().unwrap();
+        std::fs::write(
+            dir.join("mi piano.sfz"),
+            "<control> default_path=samples/
+<region> sample=c4.wav lokey=21 hikey=108 pitch_keycenter=60
+",
+        )
+        .unwrap();
+
+        let rx = prepare_in_background(
+            Source::Custom(dir.join("mi piano.sfz")),
+            Quality::Standard,
+            false,
+            || {},
+        );
+        let bank = rx
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Ready(bank) => Some(Ok(bank)),
+                Event::Failed(e) => Some(Err(e)),
+                Event::Progress(_) => None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(bank.name, "mi piano");
+        assert_eq!(bank.memory_bytes(), 44_100 * 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

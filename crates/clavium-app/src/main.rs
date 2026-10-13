@@ -108,7 +108,12 @@ fn main() -> eframe::Result {
             Some("completa") => Quality::Full,
             _ => Quality::Standard,
         };
-        let rx = instruments::prepare_in_background(&SALAMANDER, quality, true, || {});
+        let rx = instruments::prepare_in_background(
+            instruments::Source::Download(&SALAMANDER),
+            quality,
+            true,
+            || {},
+        );
         let mut last = String::new();
         for event in rx {
             match event {
@@ -190,8 +195,11 @@ struct Settings {
     volume: f32,
     sound_on: bool,
     input_offset_ms: f64,
-    /// Piano de samples elegido, o `None` para el sintetizado.
+    /// Si suena un piano de samples en lugar del sintetizado.
     sampled: bool,
+    /// `.sfz` propio del usuario; si está elegido, reemplaza al Yamaha C5.
+    custom_sfz: Option<PathBuf>,
+    use_custom: bool,
     quality: Quality,
     /// Si el usuario descartó la recomendación de bajar el Yamaha C5.
     prompt_dismissed: bool,
@@ -210,6 +218,8 @@ enum Screen {
 struct ClaviumApp {
     /// Piano de samples elegido (si es `false`, suena el sintetizado).
     sampled: bool,
+    custom_sfz: Option<PathBuf>,
+    use_custom: bool,
     quality: Quality,
     prompt_dismissed: bool,
     /// Descarga o carga del piano de samples en curso.
@@ -286,7 +296,9 @@ impl ClaviumApp {
             input_offset_ms: setting("input_offset_ms")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            sampled: setting("instrument").is_some_and(|v| v == SALAMANDER.id),
+            sampled: setting("instrument").is_some_and(|v| v == SALAMANDER.id || v == "custom"),
+            custom_sfz: setting("custom_sfz").map(PathBuf::from),
+            use_custom: setting("instrument").is_some_and(|v| v == "custom"),
             quality: setting("instrument_quality")
                 .and_then(|v| Quality::from_key(&v))
                 .unwrap_or(Quality::Standard),
@@ -315,8 +327,15 @@ impl ClaviumApp {
             store,
             stats,
             input_offset_ms: settings.input_offset_ms,
-            // Solo se usa el piano de samples si ya está descargado.
-            sampled: settings.sampled && instruments::installed(&SALAMANDER).is_some(),
+            // Solo se usa el piano de samples si sigue disponible.
+            sampled: settings.sampled
+                && if settings.use_custom {
+                    settings.custom_sfz.as_ref().is_some_and(|p| p.exists())
+                } else {
+                    instruments::installed(&SALAMANDER).is_some()
+                },
+            custom_sfz: settings.custom_sfz.clone(),
+            use_custom: settings.use_custom,
             quality: settings.quality,
             prompt_dismissed: settings.prompt_dismissed,
             piano_job: None,
@@ -367,16 +386,21 @@ impl ClaviumApp {
         app
     }
 
-    /// Descarga (si `download`) y carga el Yamaha C5 en segundo plano.
+    /// Descarga (si `download`) y carga en segundo plano el piano de samples
+    /// elegido: el Yamaha C5 o la librería propia del usuario.
     fn start_piano(&mut self, ctx: &egui::Context, download: bool) {
         if self.piano_job.is_some() {
             return;
         }
         self.piano_error = None;
         self.piano_progress = None;
+        let source = match (&self.custom_sfz, self.use_custom) {
+            (Some(path), true) => instruments::Source::Custom(path.clone()),
+            _ => instruments::Source::Download(&SALAMANDER),
+        };
         let ctx = ctx.clone();
         self.piano_job = Some(instruments::prepare_in_background(
-            &SALAMANDER,
+            source,
             self.quality,
             download,
             move || ctx.request_repaint(),
@@ -803,6 +827,8 @@ impl ClaviumApp {
             sound_on: self.sound_on,
             input_offset_ms: self.input_offset_ms,
             sampled: self.sampled,
+            custom_sfz: self.custom_sfz.clone(),
+            use_custom: self.use_custom,
             quality: self.quality,
             prompt_dismissed: self.prompt_dismissed,
         };
@@ -817,13 +843,16 @@ impl ClaviumApp {
             store.set_setting("input_offset_ms", current.input_offset_ms);
             store.set_setting(
                 "instrument",
-                if current.sampled {
-                    SALAMANDER.id
-                } else {
-                    "synth"
+                match (current.sampled, current.use_custom) {
+                    (false, _) => "synth",
+                    (true, false) => SALAMANDER.id,
+                    (true, true) => "custom",
                 },
             );
             store.set_setting("instrument_quality", current.quality.key());
+            if let Some(path) = &current.custom_sfz {
+                store.set_setting("custom_sfz", path.display());
+            }
             if current.prompt_dismissed {
                 store.set_setting("salamander_prompt", "dismissed");
             }
@@ -1105,51 +1134,117 @@ impl ClaviumApp {
 
     /// Qué piano suena: el sintetizado o el Yamaha C5 de samples.
     fn piano_selector(&mut self, ui: &mut egui::Ui) {
+        let custom_name = self
+            .custom_sfz
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned());
         if let Some(progress) = &self.piano_progress {
+            let piano = if self.use_custom {
+                custom_name.as_deref().unwrap_or("la librería")
+            } else {
+                "Yamaha C5"
+            };
             let text = match progress {
                 instruments::Progress::Downloading { done, total } => {
-                    format!("Descargando Yamaha C5: {done} de {total}")
+                    format!("Descargando {piano}: {done} de {total}")
                 }
                 instruments::Progress::Loading { done, total } => {
-                    format!("Cargando Yamaha C5: {} %", done * 100 / (*total).max(1))
+                    format!("Cargando {piano}: {} %", done * 100 / (*total).max(1))
                 }
             };
             ui.label(text);
             ui.spinner();
             return;
         }
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Choice {
+            Synth,
+            Salamander,
+            Custom,
+            PickCustom,
+        }
         let installed = instruments::installed(&SALAMANDER).is_some();
-        let current = if self.sampled {
-            "Yamaha C5"
-        } else {
-            "Sintetizado"
+        let current = match (self.sampled, self.use_custom) {
+            (false, _) => Choice::Synth,
+            (true, false) => Choice::Salamander,
+            (true, true) => Choice::Custom,
         };
-        let mut choice = self.sampled;
+        let current_text = match current {
+            Choice::Synth => "Sintetizado".to_string(),
+            Choice::Salamander => "Yamaha C5".to_string(),
+            _ => custom_name
+                .clone()
+                .unwrap_or_else(|| "Librería propia".into()),
+        };
+        let custom_credit = self
+            .custom_sfz
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "Librería SFZ propia: {}. Respetá su licencia y dale crédito a su autor.",
+                    p.display()
+                )
+            })
+            .unwrap_or_default();
+        let mut choice = current;
         egui::ComboBox::from_id_salt("piano")
-            .selected_text(current)
+            .selected_text(current_text)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut choice, false, "Sintetizado");
+                ui.selectable_value(&mut choice, Choice::Synth, "Sintetizado");
                 let label = if installed {
                     "Yamaha C5 (Salamander)"
                 } else {
                     "Yamaha C5 (Salamander): descargar"
                 };
-                ui.selectable_value(&mut choice, true, label)
+                ui.selectable_value(&mut choice, Choice::Salamander, label)
                     .on_hover_text(SALAMANDER.credit);
+                if let Some(name) = &custom_name {
+                    ui.selectable_value(
+                        &mut choice,
+                        Choice::Custom,
+                        format!("{name} (librería propia)"),
+                    )
+                    .on_hover_text(&custom_credit);
+                }
+                ui.selectable_value(&mut choice, Choice::PickCustom, "Librería SFZ propia…")
+                    .on_hover_text(
+                        "Elegí el archivo .sfz de un piano de samples que tengas en tu computadora \
+                         (por ejemplo, Ivy Audio Piano in 162 o VCSL).",
+                    );
             })
             .response
-            .on_hover_text(if self.sampled {
-                SALAMANDER.credit
-            } else {
-                "Piano generado por Clavium, sin descargas."
+            .on_hover_text(match current {
+                Choice::Synth => "Piano generado por Clavium, sin descargas.".to_string(),
+                Choice::Salamander => SALAMANDER.credit.to_string(),
+                _ => custom_credit.clone(),
             });
         ui.label("Piano:");
-        if choice != self.sampled {
-            if choice {
-                let ctx = ui.ctx().clone();
+        if choice == current {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        match choice {
+            Choice::Synth => self.use_synth(),
+            Choice::Salamander => {
+                self.use_custom = false;
                 self.start_piano(&ctx, !installed);
-            } else {
-                self.use_synth();
+            }
+            Choice::Custom => {
+                self.use_custom = true;
+                self.start_piano(&ctx, false);
+            }
+            Choice::PickCustom => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Elegí el archivo .sfz de tu piano")
+                    .add_filter("Instrumentos SFZ", &["sfz"])
+                    .pick_file()
+                {
+                    self.custom_sfz = Some(path);
+                    self.use_custom = true;
+                    self.start_piano(&ctx, false);
+                }
             }
         }
     }
@@ -2260,6 +2355,12 @@ impl ClaviumApp {
                 ui.separator();
                 ui.heading("Créditos");
                 ui.label(SALAMANDER.credit);
+                if let (true, Some(path)) = (self.use_custom, &self.custom_sfz) {
+                    ui.label(format!(
+                        "Librería SFZ propia: {}. Su licencia y crédito son los de su autor.",
+                        path.display()
+                    ));
+                }
                 if let Some(bank) = &self.piano_bank {
                     ui.label(format!(
                         "Piano cargado: {} ({:.0} MB en memoria, calidad {}).",
