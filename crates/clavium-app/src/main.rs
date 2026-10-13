@@ -5,13 +5,15 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calibration;
 mod falling;
 mod keyboard;
 mod library;
 mod live;
 mod session;
+mod store;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use clavium_audio::{AudioEngine, Command};
@@ -23,11 +25,13 @@ use eframe::egui::{
     Vec2,
 };
 
+use calibration::Calibration;
 use clavium_eval::{HandFilter, PracticeMode, Summary};
 use keyboard::{BLACK_LENGTH, KeyboardLayout, KeyboardSize, note_name};
 use library::Library;
 use live::{KeyState, LatencyStats, LiveKeys};
-use session::{Feedback, Session};
+use session::{Feedback, PracticeOptions, PracticeRange, Session};
+use store::{PieceStats, SessionRecord, Store};
 
 const ACCENT_DIM: Color32 = Color32::from_rgb(28, 86, 150);
 const ACCENT_BRIGHT: Color32 = Color32::from_rgb(110, 196, 255);
@@ -70,6 +74,10 @@ struct PlayOptions {
     hands: HandFilter,
     mode: PracticeMode,
     speed: f64,
+    /// Índice en `Piece::sections`, o `None` para la pieza completa.
+    section: Option<usize>,
+    looping: bool,
+    speed_up: bool,
 }
 
 impl Default for PlayOptions {
@@ -78,8 +86,21 @@ impl Default for PlayOptions {
             hands: HandFilter::Both,
             mode: PracticeMode::Wait,
             speed: 1.0,
+            section: None,
+            looping: false,
+            speed_up: true,
         }
     }
+}
+
+/// Preferencias que se guardan entre sesiones de la app.
+#[derive(Debug, Clone, PartialEq)]
+struct Settings {
+    size: KeyboardSize,
+    curve: VelocityCurve,
+    volume: f32,
+    sound_on: bool,
+    input_offset_ms: f64,
 }
 
 enum Screen {
@@ -89,9 +110,16 @@ enum Screen {
         session: Box<Session>,
         summary: Summary,
     },
+    Calibration(Box<Calibration>),
 }
 
 struct ClaviumApp {
+    store: Option<Store>,
+    /// Estadísticas por pieza, leídas de la base.
+    stats: HashMap<&'static str, PieceStats>,
+    saved: Settings,
+    /// Desvío medido en la calibración, en milisegundos.
+    input_offset_ms: f64,
     library: Library,
     screen: Screen,
     selected: usize,
@@ -125,24 +153,66 @@ struct ClaviumApp {
 impl ClaviumApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Sin base de datos la app funciona igual, pero no recuerda nada.
+        let store = Store::open_default().ok();
+        let setting = |key: &str| store.as_ref().and_then(|s| s.setting::<String>(key));
+        let settings = Settings {
+            size: setting("keyboard_size")
+                .and_then(|v| KeyboardSize::from_key(&v))
+                .unwrap_or(KeyboardSize::Keys88),
+            curve: setting("velocity_curve")
+                .and_then(|v| curve_from_key(&v))
+                .unwrap_or_default(),
+            volume: setting("volume")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.8),
+            sound_on: setting("sound_on").is_none_or(|v| v == "true"),
+            input_offset_ms: setting("input_offset_ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+        };
+        let library = Library::bundled();
+        let stats = library
+            .entries
+            .iter()
+            .map(|e| {
+                let stats = store
+                    .as_ref()
+                    .map(|s| s.piece_stats(e.id))
+                    .unwrap_or_default();
+                (e.id, stats)
+            })
+            .collect();
+
         let ctx = cc.egui_ctx.clone();
-        let midi = MidiService::start(ServiceConfig::default(), move || ctx.request_repaint());
-        let size = KeyboardSize::Keys88;
+        let midi_config = ServiceConfig {
+            preferred_port: setting("midi_port"),
+            ..Default::default()
+        };
+        let midi = MidiService::start(midi_config, move || ctx.request_repaint());
+        let size = settings.size;
         let (audio, audio_error) = match AudioEngine::start() {
-            Ok(engine) => (Some(engine), None),
+            Ok(engine) => {
+                engine.set_volume(settings.volume);
+                (Some(engine), None)
+            }
             Err(e) => (None, Some(e.to_string())),
         };
         ClaviumApp {
-            library: Library::bundled(),
+            store,
+            stats,
+            input_offset_ms: settings.input_offset_ms,
+            sound_on: settings.sound_on,
+            volume: settings.volume,
+            curve: settings.curve,
+            saved: settings,
+            library,
             screen: Screen::Library,
             selected: 0,
             options: PlayOptions::default(),
             audio_retry_at: audio_error.as_ref().map(|_| Instant::now() + AUDIO_RETRY),
             audio,
             audio_error,
-            sound_on: true,
-            volume: 0.8,
-            curve: VelocityCurve::Normal,
             sound_latency: LatencyStats::default(),
             midi,
             connection: Connection::Searching { lost: None },
@@ -164,6 +234,10 @@ impl ClaviumApp {
     fn press(&mut self, pitch: u8, velocity: u8, at: Instant) {
         self.keys.note_on(pitch, velocity);
         self.send_audio(Command::NoteOn { pitch, velocity });
+        if let Screen::Calibration(calibration) = &mut self.screen {
+            calibration.on_tap(at);
+            return;
+        }
         if let Screen::Playing(session) = &mut self.screen {
             session.on_user_note(pitch, at);
             // Durante una pieza el teclado de pantalla queda fijo en su rango.
@@ -206,19 +280,134 @@ impl ClaviumApp {
         let Some(entry) = self.library.entries.get(self.selected) else {
             return;
         };
+        let piece = &entry.piece;
+        let range = self
+            .options
+            .section
+            .and_then(|i| piece.sections.get(i))
+            .map(|s| {
+                let bars = piece.bar_ticks();
+                let first = bars.partition_point(|&b| b <= s.start_tick);
+                let last = bars.partition_point(|&b| b < s.end_tick);
+                PracticeRange {
+                    label: format!("{} (compases {first}–{last})", s.name),
+                    from: piece.tempo.tick_to_seconds(s.start_tick),
+                    to: piece.tempo.tick_to_seconds(s.end_tick),
+                }
+            });
+        let options = PracticeOptions {
+            hands: self.options.hands,
+            mode: self.options.mode,
+            speed: self.options.speed,
+            looping: self.options.looping && range.is_some(),
+            speed_up: self.options.speed_up,
+            range,
+            input_offset: self.input_offset_ms / 1000.0,
+        };
+        let piece = piece.clone();
+        self.begin(piece, options);
+    }
+
+    /// Repasar en bucle los compases con más fallas de la última vuelta.
+    fn practice_weak_bars(&mut self, session: &Session, bar: usize) {
+        let starts = session.eval.bar_starts();
+        let first = bar.saturating_sub(1).max(1);
+        let last = (bar + 1).min(starts.len());
+        let from = starts.get(first - 1).copied().unwrap_or(0.0);
+        let to = starts
+            .get(last)
+            .copied()
+            .unwrap_or_else(|| session.piece.duration_seconds());
+        let options = PracticeOptions {
+            range: Some(PracticeRange {
+                label: format!("Compases {first}–{last}"),
+                from,
+                to,
+            }),
+            looping: true,
+            speed_up: true,
+            speed: (session.options.speed - 0.25).max(0.5),
+            ..session.options.clone()
+        };
+        self.begin(session.piece.clone(), options);
+    }
+
+    fn begin(&mut self, piece: clavium_core::Piece, options: PracticeOptions) {
         // Que entre toda la pieza en el teclado de pantalla.
-        if let Some(shift) = self.layout.shift_to_fit(entry.lowest, entry.highest)
+        let lowest = piece.notes.iter().map(|n| n.pitch).min().unwrap_or(60);
+        let highest = piece.notes.iter().map(|n| n.pitch).max().unwrap_or(60);
+        if let Some(shift) = self.layout.shift_to_fit(lowest, highest)
             && let Some(layout) = KeyboardLayout::with_shift(self.size, shift)
         {
             self.layout = layout;
         }
-        let options = self.options;
-        self.screen = Screen::Playing(Box::new(Session::new(
-            entry.piece.clone(),
-            options.hands,
-            options.mode,
-            options.speed,
-        )));
+        self.screen = Screen::Playing(Box::new(Session::new(piece, options)));
+    }
+
+    fn update_calibration(&mut self) {
+        let Screen::Calibration(calibration) = &mut self.screen else {
+            return;
+        };
+        let commands = calibration.update(Instant::now());
+        self.send_auto(commands);
+    }
+
+    fn record(&mut self, session: &Session, summary: &Summary) {
+        let Some(entry) = self.library.entries.get(self.selected) else {
+            return;
+        };
+        if session.mode == PracticeMode::Listen {
+            return;
+        }
+        let record = SessionRecord {
+            piece: entry.id,
+            mode: session.mode,
+            hands: session.hands,
+            speed: session.speed,
+            section: session.options.range.as_ref().map(|r| r.label.as_str()),
+            summary,
+        };
+        match &self.store {
+            Some(store) => {
+                let _ = store.record_session(&record);
+                self.stats.insert(entry.id, store.piece_stats(entry.id));
+            }
+            None => {
+                // Sin base, se lleva la cuenta solo mientras la app está abierta.
+                let stats = self.stats.entry(entry.id).or_default();
+                stats.sessions += 1;
+                let counts = session.mode == PracticeMode::Rhythm
+                    && session.hands == HandFilter::Both
+                    && session.options.range.is_none();
+                if let (true, Some(accuracy)) = (counts, summary.accuracy) {
+                    stats.best_accuracy = Some(stats.best_accuracy.unwrap_or(0.0).max(accuracy));
+                    if accuracy >= store::MASTERED_ACCURACY {
+                        stats.best_speed = Some(stats.best_speed.unwrap_or(0.0).max(session.speed));
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let current = Settings {
+            size: self.size,
+            curve: self.curve,
+            volume: self.volume,
+            sound_on: self.sound_on,
+            input_offset_ms: self.input_offset_ms,
+        };
+        if current == self.saved {
+            return;
+        }
+        if let Some(store) = &self.store {
+            store.set_setting("keyboard_size", current.size.key());
+            store.set_setting("velocity_curve", curve_key(current.curve));
+            store.set_setting("volume", current.volume);
+            store.set_setting("sound_on", current.sound_on);
+            store.set_setting("input_offset_ms", current.input_offset_ms);
+        }
+        self.saved = current;
     }
 
     fn leave_session(&mut self) {
@@ -227,6 +416,16 @@ impl ClaviumApp {
             let commands = session.stop_auto();
             self.send_auto(commands);
         }
+    }
+
+    /// Termina un bucle y muestra el resultado de la última vuelta.
+    fn finish_loop(&mut self) {
+        let Screen::Playing(session) = &mut self.screen else {
+            return;
+        };
+        let commands = session.finish();
+        self.send_auto(commands);
+        self.update_session();
     }
 
     fn update_session(&mut self) {
@@ -242,12 +441,7 @@ impl ClaviumApp {
                 unreachable!()
             };
             let summary = session.summary();
-            if let (Some(accuracy), Some(entry)) =
-                (summary.accuracy, self.library.entries.get(self.selected))
-                && session.mode == PracticeMode::Rhythm
-            {
-                self.library.record(entry.id, accuracy);
-            }
+            self.record(&session, &summary);
             self.screen = Screen::Results { session, summary };
         }
     }
@@ -305,6 +499,9 @@ impl ClaviumApp {
                 MidiEvent::PortsChanged(ports) => self.ports = ports,
                 MidiEvent::Connected { port } => {
                     self.push_log(format!("conectado: {port}"));
+                    if let Some(store) = &self.store {
+                        store.set_setting("midi_port", &port);
+                    }
                     self.connection = Connection::Connected(port);
                 }
                 MidiEvent::Disconnected { port } => {
@@ -362,6 +559,10 @@ impl ClaviumApp {
                         self.leave_session();
                         continue;
                     }
+                    (Screen::Calibration(_), egui::Key::Escape) => {
+                        self.screen = Screen::Library;
+                        continue;
+                    }
                     _ => {}
                 }
                 match key {
@@ -408,6 +609,18 @@ impl ClaviumApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.toggle_value(&mut self.show_diagnostics, "Diagnóstico");
+                let calibrate = ui
+                    .add_enabled(
+                        matches!(self.screen, Screen::Library),
+                        egui::Button::new("Calibrar"),
+                    )
+                    .on_hover_text(format!(
+                        "Mide tu desvío al tocar para evaluarte con justicia. Ahora: {:+.0} ms",
+                        self.input_offset_ms
+                    ));
+                if calibrate.clicked() {
+                    self.screen = Screen::Calibration(Box::default());
+                }
                 ui.separator();
 
                 let before = self.size;
@@ -472,16 +685,30 @@ impl ClaviumApp {
         );
         ui.add_space(12.0);
 
-        let cards: Vec<(String, String, Option<f64>)> = self
+        let cards: Vec<(String, String, Option<String>)> = self
             .library
             .entries
             .iter()
             .map(|e| {
-                (
-                    e.piece.metadata.title.clone(),
-                    e.subtitle(),
-                    self.library.best.get(e.id).copied(),
-                )
+                let progress = self.stats.get(e.id).and_then(|s| {
+                    let mut parts = Vec::new();
+                    if let Some(best) = s.best_accuracy {
+                        parts.push(format!("Mejor: {:.0} %", best * 100.0));
+                    }
+                    if let Some(speed) = s.best_speed {
+                        parts.push(format!("Dominada al {:.0} %", speed * 100.0));
+                    }
+                    if s.sessions > 0 {
+                        let plural = if s.sessions == 1 {
+                            "sesión"
+                        } else {
+                            "sesiones"
+                        };
+                        parts.push(format!("{} {plural}", s.sessions));
+                    }
+                    (!parts.is_empty()).then(|| parts.join(" · "))
+                });
+                (e.piece.metadata.title.clone(), e.subtitle(), progress)
             })
             .collect();
         let mut start = false;
@@ -490,7 +717,7 @@ impl ClaviumApp {
             egui::ScrollArea::vertical()
                 .id_salt("pieces")
                 .show(&mut cols[0], |ui| {
-                    for (i, (title, subtitle, best)) in cards.iter().enumerate() {
+                    for (i, (title, subtitle, progress)) in cards.iter().enumerate() {
                         let selected = i == self.selected;
                         let fill = if selected {
                             ACCENT_DIM.gamma_multiply(0.55)
@@ -507,17 +734,15 @@ impl ClaviumApp {
                                 ui.label(
                                     RichText::new(subtitle).color(ui.visuals().weak_text_color()),
                                 );
-                                if let Some(best) = best {
-                                    ui.label(format!(
-                                        "Mejor puntaje en ritmo: {:.0} %",
-                                        best * 100.0
-                                    ));
+                                if let Some(progress) = progress {
+                                    ui.label(RichText::new(progress).color(OK_GREEN));
                                 }
                             })
                             .response
                             .interact(Sense::click());
-                        if response.clicked() {
+                        if response.clicked() && self.selected != i {
                             self.selected = i;
+                            self.options.section = None;
                         }
                         if response.double_clicked() {
                             self.selected = i;
@@ -558,6 +783,40 @@ impl ClaviumApp {
                 ui.selectable_value(&mut self.options.speed, 0.75, "75 %");
                 ui.selectable_value(&mut self.options.speed, 1.0, "100 %");
             });
+            ui.add_space(10.0);
+
+            let sections: Vec<String> = self
+                .library
+                .entries
+                .get(self.selected)
+                .map(|e| e.piece.sections.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            if !sections.is_empty() {
+                ui.label(RichText::new("Qué practicar").strong());
+                let current = self
+                    .options
+                    .section
+                    .and_then(|i| sections.get(i).cloned())
+                    .unwrap_or_else(|| "La pieza completa".to_string());
+                egui::ComboBox::from_id_salt("section")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.options.section, None, "La pieza completa");
+                        for (i, name) in sections.iter().enumerate() {
+                            ui.selectable_value(&mut self.options.section, Some(i), name);
+                        }
+                    });
+                if self.options.section.is_some() {
+                    ui.checkbox(&mut self.options.looping, "Repetir en bucle");
+                    ui.add_enabled(
+                        self.options.looping,
+                        egui::Checkbox::new(
+                            &mut self.options.speed_up,
+                            "Subir el tempo 5 % por vuelta si pasás el 90 %",
+                        ),
+                    );
+                }
+            }
             ui.add_space(16.0);
             let tocar = ui.add_sized(
                 [180.0, 44.0],
@@ -624,6 +883,7 @@ impl ClaviumApp {
         let mut leave = false;
         let mut restart = false;
         let mut toggle = false;
+        let mut finish = false;
 
         ui.horizontal(|ui| {
             if ui.button("← Biblioteca").on_hover_text("Esc").clicked() {
@@ -635,11 +895,21 @@ impl ClaviumApp {
                 PracticeMode::Rhythm => "Modo ritmo",
                 PracticeMode::Listen => "Escucha",
             };
-            ui.label(
-                RichText::new(format!("{mode} · {:.0} %", session.speed * 100.0))
-                    .color(ui.visuals().weak_text_color()),
-            );
+            let mut detail = format!("{mode} · {:.0} %", session.speed * 100.0);
+            if let Some(range) = &session.options.range {
+                detail.push_str(&format!(" · {}", range.label));
+            }
+            if session.options.looping {
+                detail.push_str(&format!(" · Vuelta {}", session.passes().len() + 1));
+                if let Some(accuracy) = session.passes().last().and_then(|p| p.accuracy) {
+                    detail.push_str(&format!(", la anterior {:.0} %", accuracy * 100.0));
+                }
+            }
+            ui.label(RichText::new(detail).color(ui.visuals().weak_text_color()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if session.options.looping && ui.button("Terminar").clicked() {
+                    finish = true;
+                }
                 if ui.button("Reiniciar").clicked() {
                     restart = true;
                 }
@@ -667,12 +937,13 @@ impl ClaviumApp {
         falling::draw(&painter, rect, &self.layout, key_w, session);
 
         let position = session.clock.position();
+        let from = session.options.range.as_ref().map_or(0.0, |r| r.from);
         let overlay = if !session.clock.is_running() {
             Some("En pausa. Espacio para seguir.".to_string())
-        } else if position < 0.0 {
+        } else if position < from {
             Some(format!(
                 "Empieza en {:.0}…",
-                (-position / session.speed).ceil()
+                ((from - position) / session.speed).ceil()
             ))
         } else if session.mode == PracticeMode::Wait
             && session.eval.wait_gate().is_some_and(|g| position >= g)
@@ -701,7 +972,9 @@ impl ClaviumApp {
             **session = fresh;
             self.send_auto(commands);
         }
-        if leave {
+        if finish {
+            self.finish_loop();
+        } else if leave {
             self.leave_session();
         }
     }
@@ -712,6 +985,7 @@ impl ClaviumApp {
         };
         let mut again = false;
         let mut leave = false;
+        let mut practice = None;
         let weak = ui.visuals().weak_text_color();
 
         ui.vertical_centered(|ui| {
@@ -770,16 +1044,36 @@ impl ClaviumApp {
                             summary.weakest_bars.iter().map(|b| b.to_string()).collect();
                         ui.label(format!("Compases para repasar: {}", bars.join(", ")));
                     }
+                    if session.passes().len() > 1 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} vueltas; el resultado es el de la última, a {:.0} %.",
+                                session.passes().len(),
+                                session.speed * 100.0
+                            ))
+                            .color(weak),
+                        );
+                    }
                 }
             }
             ui.add_space(20.0);
+            let weakest = summary.weakest_bars.first().copied();
+            let buttons = if weakest.is_some() { 450.0 } else { 300.0 };
             ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 300.0).max(0.0) / 2.0);
+                ui.add_space((ui.available_width() - buttons).max(0.0) / 2.0);
                 if ui
                     .add_sized([140.0, 40.0], egui::Button::new("Repetir"))
                     .clicked()
                 {
                     again = true;
+                }
+                if let Some(bar) = weakest
+                    && ui
+                        .add_sized([140.0, 40.0], egui::Button::new(format!("Repasar compás {bar}")))
+                        .on_hover_text("En bucle, desde un compás antes hasta uno después, más lento y subiendo el tempo si te sale.")
+                        .clicked()
+                {
+                    practice = Some(bar);
                 }
                 if ui
                     .add_sized([140.0, 40.0], egui::Button::new("Biblioteca"))
@@ -793,8 +1087,142 @@ impl ClaviumApp {
         if again && let Screen::Results { session, .. } = &self.screen {
             let fresh = session.restarted();
             self.screen = Screen::Playing(Box::new(fresh));
+        } else if let Some(bar) = practice
+            && let Screen::Results { session, .. } =
+                std::mem::replace(&mut self.screen, Screen::Library)
+        {
+            self.practice_weak_bars(&session, bar);
         } else if leave {
             self.leave_session();
+        }
+    }
+
+    fn calibration_screen(&mut self, ui: &mut egui::Ui) {
+        let Screen::Calibration(calibration) = &self.screen else {
+            return;
+        };
+        let mut close = false;
+        let mut save = None;
+        let mut again = false;
+
+        ui.horizontal(|ui| {
+            if ui.button("← Biblioteca").on_hover_text("Esc").clicked() {
+                close = true;
+            }
+            ui.label(RichText::new("Calibración").size(18.0).strong());
+        });
+        ui.add_space(6.0);
+
+        if calibration.is_finished() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                match calibration.result() {
+                    Some(offset) => {
+                        let ms = offset * 1000.0;
+                        let text = if ms.abs() < 10.0 {
+                            "Tocás prácticamente a tiempo: casi no hace falta corregir.".to_string()
+                        } else if ms > 0.0 {
+                            format!(
+                                "Tocás unos {ms:.0} ms después de que la nota llega a la línea."
+                            )
+                        } else {
+                            format!(
+                                "Tocás unos {:.0} ms antes de que la nota llegue a la línea.",
+                                -ms
+                            )
+                        };
+                        ui.label(RichText::new(text).size(20.0));
+                        ui.label(
+                            RichText::new(
+                                "Clavium va a descontar ese desvío al evaluar el modo ritmo.",
+                            )
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 300.0).max(0.0) / 2.0);
+                            if ui
+                                .add_sized([140.0, 40.0], egui::Button::new("Guardar"))
+                                .clicked()
+                            {
+                                save = Some(ms);
+                            }
+                            if ui
+                                .add_sized([140.0, 40.0], egui::Button::new("Repetir"))
+                                .clicked()
+                            {
+                                again = true;
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(RichText::new("No llegué a medir suficientes notas.").size(20.0));
+                        ui.label(format!(
+                            "Hacen falta al menos {} toques cerca de la línea.",
+                            calibration::MIN_TAPS
+                        ));
+                        ui.add_space(16.0);
+                        if ui
+                            .add_sized([140.0, 40.0], egui::Button::new("Repetir"))
+                            .clicked()
+                        {
+                            again = true;
+                        }
+                    }
+                }
+            });
+        } else {
+            let rect = ui.available_rect_before_wrap();
+            ui.allocate_rect(rect, Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(22, 22, 26));
+            let t = calibration.clock.position();
+            let window = falling::LOOKAHEAD_SECONDS;
+            let lane = Rect::from_center_size(
+                Pos2::new(rect.center().x, rect.center().y),
+                Vec2::new(160.0, rect.height()),
+            );
+            for i in 0..calibration::BEATS {
+                let beat = Calibration::beat_time(i);
+                if beat < t - 0.2 || beat > t + window {
+                    continue;
+                }
+                let y = rect.bottom() - ((beat - t) / window) as f32 * rect.height();
+                let bar =
+                    Rect::from_center_size(Pos2::new(lane.center().x, y), Vec2::new(160.0, 14.0));
+                painter.rect_filled(bar, 6.0, falling::RIGHT_HAND);
+            }
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(rect.left(), rect.bottom() - 2.0),
+                    Vec2::new(rect.width(), 3.0),
+                ),
+                0.0,
+                ACCENT_BRIGHT,
+            );
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 40.0),
+                Align2::CENTER_CENTER,
+                "Tocá cualquier tecla justo cuando cada barra llega a la línea",
+                FontId::proportional(20.0),
+                Color32::from_gray(210),
+            );
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 72.0),
+                Align2::CENTER_CENTER,
+                format!("{} notas medidas", calibration.measured()),
+                FontId::proportional(15.0),
+                Color32::from_gray(150),
+            );
+        }
+
+        if let Some(ms) = save {
+            self.input_offset_ms = ms;
+            self.screen = Screen::Library;
+        } else if again {
+            self.screen = Screen::Calibration(Box::default());
+        } else if close {
+            self.screen = Screen::Library;
         }
     }
 
@@ -963,7 +1391,8 @@ impl eframe::App for ClaviumApp {
         self.handle_computer_keyboard(ctx);
         self.update_audio();
         self.update_session();
-        if matches!(self.screen, Screen::Playing(_)) {
+        self.update_calibration();
+        if matches!(self.screen, Screen::Playing(_) | Screen::Calibration(_)) {
             // Las notas caen: hay que dibujar todos los cuadros.
             ctx.request_repaint();
         } else if self.audio.is_none() {
@@ -993,7 +1422,9 @@ impl eframe::App for ClaviumApp {
                 Screen::Library => self.library_screen(ui),
                 Screen::Playing(_) => self.playing_screen(ui),
                 Screen::Results { .. } => self.results_screen(ui),
+                Screen::Calibration(_) => self.calibration_screen(ui),
             });
+        self.save_settings();
 
         if self.show_diagnostics {
             let ctx = ui.ctx().clone();
@@ -1013,6 +1444,21 @@ impl eframe::App for ClaviumApp {
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);
+}
+
+fn curve_key(curve: VelocityCurve) -> &'static str {
+    match curve {
+        VelocityCurve::Light => "light",
+        VelocityCurve::Normal => "normal",
+        VelocityCurve::Heavy => "heavy",
+        VelocityCurve::Fixed => "fixed",
+    }
+}
+
+fn curve_from_key(key: &str) -> Option<VelocityCurve> {
+    VelocityCurve::ALL
+        .into_iter()
+        .find(|c| curve_key(*c) == key)
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {

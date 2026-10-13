@@ -35,6 +35,20 @@ impl KeyboardSize {
         }
     }
 
+    /// Clave para guardar la preferencia.
+    pub fn key(self) -> &'static str {
+        match self {
+            KeyboardSize::Keys88 => "88",
+            KeyboardSize::Keys76 => "76",
+            KeyboardSize::Keys61 => "61",
+            KeyboardSize::Keys49 => "49",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        KeyboardSize::ALL.into_iter().find(|s| s.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             KeyboardSize::Keys88 => "88 teclas",

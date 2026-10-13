@@ -184,6 +184,19 @@ impl Evaluator {
         windows: Windows,
         speed: f64,
     ) -> Self {
+        Self::new_in_range(piece, hands, mode, windows, speed, None)
+    }
+
+    /// Como [`Evaluator::new`], pero solo con las notas que empiezan dentro
+    /// de `range` (en segundos de la pieza), para practicar una sección.
+    pub fn new_in_range(
+        piece: &Piece,
+        hands: HandFilter,
+        mode: PracticeMode,
+        windows: Windows,
+        speed: f64,
+        range: Option<(f64, f64)>,
+    ) -> Self {
         let bar_starts: Vec<f64> = piece
             .bar_ticks()
             .into_iter()
@@ -204,6 +217,9 @@ impl Evaluator {
                     hand: n.hand,
                     bar: bar_of(start),
                 }
+            })
+            .filter(|e| {
+                range.is_none_or(|(from, to)| e.start >= from - 1e-9 && e.start < to - 1e-9)
             })
             .collect();
         expected.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.pitch.cmp(&b.pitch)));
@@ -607,6 +623,22 @@ mod tests {
         let s = ev.summary();
         assert_eq!((s.perfect, s.wrong, s.stars), (4, 1, 0));
         assert!((s.accuracy.unwrap() - 0.98).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_range_keeps_only_the_notes_of_that_section() {
+        let p = scale();
+        let ev = Evaluator::new_in_range(
+            &p,
+            HandFilter::Both,
+            PracticeMode::Rhythm,
+            Windows::default(),
+            1.0,
+            Some((4.0, 8.0)),
+        );
+        let pitches: Vec<u8> = ev.expected().iter().map(|e| e.pitch).collect();
+        assert_eq!(pitches, vec![43, 67]);
+        assert!(ev.expected().iter().all(|e| e.bar == 2));
     }
 
     #[test]

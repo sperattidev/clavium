@@ -1,7 +1,5 @@
 //! Biblioteca inicial que viene con la app.
 
-use std::collections::HashMap;
-
 use clavium_core::notation::parse_piece;
 use clavium_core::{Arrangement, Hand, Piece};
 
@@ -59,8 +57,6 @@ impl LibraryEntry {
 
 pub struct Library {
     pub entries: Vec<LibraryEntry>,
-    /// Mejor precisión por pieza en esta sesión de la app.
-    pub best: HashMap<&'static str, f64>,
 }
 
 impl Library {
@@ -84,15 +80,7 @@ impl Library {
                 }
             })
             .collect();
-        Library {
-            entries,
-            best: HashMap::new(),
-        }
-    }
-
-    pub fn record(&mut self, id: &'static str, accuracy: f64) {
-        let best = self.best.entry(id).or_insert(0.0);
-        *best = best.max(accuracy);
+        Library { entries }
     }
 }
 
@@ -105,13 +93,5 @@ mod tests {
         let library = Library::bundled();
         assert_eq!(library.entries.len(), 3);
         assert!(library.entries.iter().all(|e| e.duration > 5.0));
-    }
-
-    #[test]
-    fn best_score_only_goes_up() {
-        let mut library = Library::bundled();
-        library.record("estrellita", 0.8);
-        library.record("estrellita", 0.6);
-        assert_eq!(library.best["estrellita"], 0.8);
     }
 }

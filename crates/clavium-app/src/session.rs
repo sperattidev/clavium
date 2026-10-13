@@ -88,14 +88,62 @@ pub enum Feedback {
     Wrong,
 }
 
+/// Una parte de la pieza para practicar, en segundos a tempo original.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PracticeRange {
+    pub label: String,
+    pub from: f64,
+    pub to: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PracticeOptions {
+    pub hands: HandFilter,
+    pub mode: PracticeMode,
+    pub speed: f64,
+    /// `None` es la pieza completa.
+    pub range: Option<PracticeRange>,
+    /// Repetir hasta que el usuario termine.
+    pub looping: bool,
+    /// Subir el tempo 5 % por vuelta si la precisión supera el 90 %.
+    pub speed_up: bool,
+    /// Desvío medio medido en la calibración, en segundos reales: se
+    /// descuenta de cada nota antes de evaluarla.
+    pub input_offset: f64,
+}
+
+impl Default for PracticeOptions {
+    fn default() -> Self {
+        PracticeOptions {
+            hands: HandFilter::Both,
+            mode: PracticeMode::Wait,
+            speed: 1.0,
+            range: None,
+            looping: false,
+            speed_up: false,
+            input_offset: 0.0,
+        }
+    }
+}
+
+/// Aumento de tempo por vuelta y precisión necesaria para ganarlo.
+pub const SPEED_STEP: f64 = 0.05;
+pub const SPEED_UP_ACCURACY: f64 = 0.9;
+/// Cuenta previa entre vueltas de un bucle, en segundos reales.
+const LOOP_LEAD_SECONDS: f64 = 1.5;
+
 pub struct Session {
     pub title: String,
     pub piece: Piece,
+    pub options: PracticeOptions,
     pub eval: Evaluator,
     pub clock: MusicClock,
     pub hands: HandFilter,
     pub mode: PracticeMode,
+    /// Velocidad de la vuelta actual; en un bucle puede subir.
     pub speed: f64,
+    /// Resultados de las vueltas terminadas.
+    passes: Vec<Summary>,
     /// Índices de las notas que toca la app, en orden de inicio.
     auto: Vec<usize>,
     auto_next: usize,
@@ -106,50 +154,98 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(piece: Piece, hands: HandFilter, mode: PracticeMode, speed: f64) -> Self {
-        let eval = Evaluator::new(&piece, hands, mode, Windows::default(), speed);
-        let auto = eval
+    pub fn new(piece: Piece, options: PracticeOptions) -> Self {
+        let mut session = Session {
+            title: piece.metadata.title.clone(),
+            eval: Evaluator::new(&piece, options.hands, options.mode, Windows::default(), 1.0),
+            clock: MusicClock::new(0.0, 1.0),
+            hands: options.hands,
+            mode: options.mode,
+            speed: options.speed,
+            piece,
+            options,
+            passes: Vec::new(),
+            auto: Vec::new(),
+            auto_next: 0,
+            auto_sounding: Vec::new(),
+            feedback: [None; 128],
+            finished: false,
+        };
+        session.start_pass(LEAD_IN_SECONDS);
+        session
+    }
+
+    fn range(&self) -> Option<(f64, f64)> {
+        self.options.range.as_ref().map(|r| (r.from, r.to))
+    }
+
+    fn start_pass(&mut self, lead_in: f64) {
+        self.eval = Evaluator::new_in_range(
+            &self.piece,
+            self.hands,
+            self.mode,
+            Windows::default(),
+            self.speed,
+            self.range(),
+        );
+        self.auto = self
+            .eval
             .outcomes()
             .iter()
             .enumerate()
             .filter(|(_, o)| **o == Outcome::Ignored)
             .map(|(i, _)| i)
             .collect();
-        let mut clock = MusicClock::new(-LEAD_IN_SECONDS * speed, speed);
-        clock.play();
-        Session {
-            title: piece.metadata.title.clone(),
-            piece,
-            eval,
-            clock,
-            hands,
-            mode,
-            speed,
-            auto,
-            auto_next: 0,
-            auto_sounding: Vec::new(),
-            feedback: [None; 128],
-            finished: false,
-        }
+        self.auto_next = 0;
+        let from = self.range().map_or(0.0, |(from, _)| from);
+        self.clock = MusicClock::new(from - lead_in * self.speed, self.speed);
+        self.clock.play();
     }
 
     /// Vuelve a empezar con las mismas opciones.
     pub fn restarted(&self) -> Self {
-        Session::new(self.piece.clone(), self.hands, self.mode, self.speed)
+        Session::new(self.piece.clone(), self.options.clone())
     }
 
     pub fn is_finished(&self) -> bool {
         self.finished
     }
 
-    pub fn summary(&self) -> Summary {
-        self.eval.summary()
+    /// Vueltas terminadas en un bucle.
+    pub fn passes(&self) -> &[Summary] {
+        &self.passes
     }
 
-    /// Progreso de 0 a 1.
+    /// Resultado de la última vuelta terminada, o de la actual si no hay.
+    pub fn summary(&self) -> Summary {
+        self.passes
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.eval.summary())
+    }
+
+    /// Termina un bucle a pedido del usuario.
+    pub fn finish(&mut self) -> Vec<Command> {
+        if self.passes.is_empty() {
+            self.passes.push(self.eval.summary());
+        }
+        self.finished = true;
+        self.stop_auto()
+    }
+
+    /// Fin de la vuelta: el final del rango o de la última nota.
+    fn pass_end(&self) -> f64 {
+        match self.range() {
+            Some((_, to)) => to,
+            None => self.eval.end_time() + TAIL_SECONDS * self.speed,
+        }
+    }
+
+    /// Progreso de 0 a 1 dentro de la vuelta.
     pub fn progress(&self) -> f32 {
-        let end = self.eval.end_time().max(0.001);
-        (self.clock.position() / end).clamp(0.0, 1.0) as f32
+        let from = self.range().map_or(0.0, |(from, _)| from);
+        let span = (self.pass_end() - from).max(0.001);
+        ((self.clock.position() - from) / span).clamp(0.0, 1.0) as f32
     }
 
     pub fn feedback(&self, pitch: u8) -> Option<Feedback> {
@@ -190,10 +286,20 @@ impl Session {
             });
         }
 
-        let tail = TAIL_SECONDS * self.speed;
-        if self.eval.is_complete() && t >= self.eval.end_time() + tail {
-            self.finished = true;
+        if self.eval.is_complete() && t >= self.pass_end() {
             commands.extend(self.stop_auto());
+            let summary = self.eval.summary();
+            if self.options.looping {
+                let improved = summary.accuracy.is_some_and(|a| a >= SPEED_UP_ACCURACY);
+                if self.options.speed_up && improved {
+                    self.speed = (self.speed + SPEED_STEP).min(1.0);
+                }
+                self.passes.push(summary);
+                self.start_pass(LOOP_LEAD_SECONDS);
+            } else {
+                self.passes.push(summary);
+                self.finished = true;
+            }
         }
         commands
     }
@@ -203,7 +309,8 @@ impl Session {
         if self.finished || self.mode == PracticeMode::Listen {
             return None;
         }
-        let t = self.clock.time_at(at);
+        // Se descuenta el desvío propio del usuario y su equipo.
+        let t = self.clock.time_at(at) - self.options.input_offset * self.speed;
         let judgement = self.eval.on_note(pitch, t);
         if let Some(slot) = self.feedback.get_mut(usize::from(pitch)) {
             *slot = Some(match judgement {
@@ -284,6 +391,82 @@ mod tests {
         parse_piece("title: x\ntempo: 60\ntime: 4/4\nright: C4 D4 E4 F4\nleft: C3:4").unwrap()
     }
 
+    fn opts(hands: HandFilter, mode: PracticeMode) -> PracticeOptions {
+        PracticeOptions {
+            hands,
+            mode,
+            ..Default::default()
+        }
+    }
+
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+
+    #[test]
+    fn a_loop_restarts_the_section_and_speeds_up_after_a_good_pass() {
+        let two_bars = parse_piece(
+            "title: x\ntempo: 60\ntime: 4/4\nright: C4 D4 E4 F4 | G4:4\nleft: R:4 | R:4",
+        )
+        .unwrap();
+        let options = PracticeOptions {
+            hands: HandFilter::Right,
+            mode: PracticeMode::Wait,
+            speed: 0.5,
+            range: Some(PracticeRange {
+                label: "Compás 1".into(),
+                from: 0.0,
+                to: 4.0,
+            }),
+            looping: true,
+            speed_up: true,
+            input_offset: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut s = Session::new(two_bars, options);
+        assert_eq!(s.eval.expected().len(), 4, "solo las notas del compás 1");
+        s.update(t0);
+        // Tocar las cuatro notas cuando el reloj llega a cada una.
+        let mut now = t0;
+        for (i, pitch) in [60u8, 62, 64, 65].into_iter().enumerate() {
+            now = t0 + secs(LEAD_IN_SECONDS + i as f64 * 2.0);
+            s.update(now);
+            assert!(matches!(
+                s.on_user_note(pitch, now),
+                Some(Judgement::Hit { .. })
+            ));
+        }
+        // Al llegar al final del compás empieza la vuelta 2, un 5 % más rápida.
+        s.update(now + secs(2.1));
+        assert_eq!(s.passes().len(), 1);
+        assert!((s.speed - 0.55).abs() < 1e-9);
+        assert!(!s.is_finished());
+        assert!(s.clock.position() < 0.0, "nueva cuenta previa");
+
+        s.finish();
+        assert!(s.is_finished());
+        assert_eq!(s.summary().perfect, 4);
+    }
+
+    #[test]
+    fn the_calibration_offset_is_discounted() {
+        let t0 = Instant::now();
+        let mut options = opts(HandFilter::Right, PracticeMode::Rhythm);
+        options.input_offset = 0.08;
+        let mut s = Session::new(piece(), options);
+        s.update(t0);
+        // El usuario toca siempre 80 ms tarde: con la calibración es perfecto.
+        let at = t0 + secs(LEAD_IN_SECONDS + 0.08);
+        s.update(at);
+        assert!(matches!(
+            s.on_user_note(60, at),
+            Some(Judgement::Hit {
+                grade: clavium_eval::Grade::Perfect,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn clock_follows_speed_and_stops_at_the_gate() {
         let t0 = Instant::now();
@@ -310,7 +493,7 @@ mod tests {
     #[test]
     fn the_app_plays_the_other_hand() {
         let t0 = Instant::now();
-        let mut s = Session::new(piece(), HandFilter::Right, PracticeMode::Rhythm, 1.0);
+        let mut s = Session::new(piece(), opts(HandFilter::Right, PracticeMode::Rhythm));
         s.update(t0);
         let early = s.update(t0 + Duration::from_secs_f64(LEAD_IN_SECONDS - 0.1));
         assert!(early.is_empty());
@@ -329,7 +512,7 @@ mod tests {
     #[test]
     fn wait_mode_holds_the_other_hand_until_the_chord_is_played() {
         let t0 = Instant::now();
-        let mut s = Session::new(piece(), HandFilter::Right, PracticeMode::Wait, 1.0);
+        let mut s = Session::new(piece(), opts(HandFilter::Right, PracticeMode::Wait));
         s.update(t0);
         let waiting = s.update(t0 + Duration::from_secs_f64(LEAD_IN_SECONDS + 1.0));
         assert!(waiting.is_empty(), "la izquierda espera al Do4");
@@ -351,7 +534,7 @@ mod tests {
     #[test]
     fn a_session_finishes_after_the_last_note() {
         let t0 = Instant::now();
-        let mut s = Session::new(piece(), HandFilter::Right, PracticeMode::Rhythm, 1.0);
+        let mut s = Session::new(piece(), opts(HandFilter::Right, PracticeMode::Rhythm));
         s.update(t0);
         s.update(t0 + Duration::from_secs_f64(LEAD_IN_SECONDS + 4.5));
         assert!(!s.is_finished());
