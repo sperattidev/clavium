@@ -1,12 +1,11 @@
-//! "Mis piezas": archivos MIDI que el usuario importa. Se guardan solo en su
-//! computadora, convertidos a `.clav`; Clavium no los distribuye.
+//! "Mis piezas": archivos MIDI o MusicXML que el usuario importa. Se guardan
+//! solo en su computadora, convertidos a `.clav`; Clavium no los distribuye.
 
 use std::path::{Path, PathBuf};
 
 use clavium_core::analysis::{auto_sections, estimate_level};
-use clavium_core::midi::{
-    MidiPart, PartChoice, PartHand, default_choices, import_parts, inspect_parts,
-};
+use clavium_core::midi::{self, MidiPart, PartChoice, PartHand, default_choices};
+use clavium_core::musicxml;
 use clavium_core::validate::{IssueKind, validate};
 use clavium_core::{PIANO_HIGHEST, PIANO_LOWEST, Piece, clav, sha256_hex};
 
@@ -25,6 +24,8 @@ pub struct PendingImport {
     /// Si cada parte se toca, y con qué mano.
     pub choices: Vec<(bool, PartHand)>,
     bytes: Vec<u8>,
+    /// MusicXML (o .mxl) en lugar de MIDI.
+    musicxml: bool,
 }
 
 impl PendingImport {
@@ -38,7 +39,12 @@ impl PendingImport {
     }
 
     pub fn from_bytes(file_name: String, bytes: Vec<u8>) -> Result<Self, String> {
-        let parts = inspect_parts(&bytes).map_err(|e| e.to_string())?;
+        let is_xml = musicxml::looks_like_musicxml(&bytes);
+        let parts = if is_xml {
+            musicxml::inspect_parts(&bytes).map_err(|e| e.to_string())?
+        } else {
+            midi::inspect_parts(&bytes).map_err(|e| e.to_string())?
+        };
         if parts.iter().all(|p| p.drums) {
             return Err("el archivo no tiene notas para tocar en piano".into());
         }
@@ -53,6 +59,7 @@ impl PendingImport {
             parts,
             choices,
             bytes,
+            musicxml: is_xml,
         })
     }
 
@@ -80,7 +87,11 @@ impl PendingImport {
         if choices.is_empty() {
             return Err("elegí al menos una parte para tocar".into());
         }
-        let mut piece = import_parts(&self.bytes, &choices).map_err(|e| e.to_string())?;
+        let mut piece = if self.musicxml {
+            musicxml::import_parts(&self.bytes, &choices).map_err(|e| e.to_string())?
+        } else {
+            midi::import_parts(&self.bytes, &choices).map_err(|e| e.to_string())?
+        };
         // Notas que el piano no puede tocar o que no duran nada.
         piece.notes.retain(|n| {
             n.end_tick > n.start_tick && (PIANO_LOWEST..=PIANO_HIGHEST).contains(&n.pitch)

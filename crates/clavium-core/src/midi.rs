@@ -379,7 +379,7 @@ fn note(pitch: u8, velocity: u8, start_tick: u64, end_tick: u64) -> Note {
 /// es la mano derecha. Así funciona tanto con una pista por mano como con
 /// una pista por voz (lo que generan muchos editores de partituras). Con una
 /// sola pista se divide por altura en el Do central.
-fn assign_hands_by_part(notes: &mut [(PartId, Note)]) {
+pub(crate) fn assign_hands_by_part(notes: &mut [(PartId, Note)]) {
     let mut by_track: HashMap<PartId, (u64, u64)> = HashMap::new(); // parte -> (suma de alturas, cantidad)
     for (track, n) in notes.iter() {
         let entry = by_track.entry(*track).or_default();

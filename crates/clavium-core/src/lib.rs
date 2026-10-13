@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod clav;
 pub mod midi;
 pub mod model;
+pub mod musicxml;
 pub mod notation;
 pub mod tempo;
 pub mod validate;

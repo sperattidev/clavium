@@ -609,10 +609,10 @@ impl ClaviumApp {
                         .and_then(|bytes| catalog::install_zip(&bytes, &catalog::default_dir()));
                     self.finish_install(result);
                 }
-                "mid" | "midi" => self.open_midi(path),
+                "mid" | "midi" | "musicxml" | "xml" | "mxl" => self.open_midi(path),
                 _ => {
                     self.library_message = Some(
-                        "Se pueden arrastrar archivos MIDI (.mid) o paquetes de catálogo (.zip)."
+                        "Se pueden arrastrar archivos MIDI (.mid), MusicXML (.musicxml, .mxl) o paquetes de catálogo (.zip)."
                             .into(),
                     );
                 }
@@ -633,8 +633,11 @@ impl ClaviumApp {
 
     fn pick_midi(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Importar un archivo MIDI")
-            .add_filter("Archivos MIDI", &["mid", "midi"])
+            .set_title("Importar un archivo MIDI o MusicXML")
+            .add_filter(
+                "MIDI y MusicXML",
+                &["mid", "midi", "musicxml", "xml", "mxl"],
+            )
             .pick_file()
         {
             self.open_midi(&path);
@@ -657,7 +660,7 @@ impl ClaviumApp {
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
-        egui::Window::new("Importar MIDI")
+        egui::Window::new("Importar pieza")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1318,9 +1321,9 @@ impl ClaviumApp {
             }
             ui.add_space(16.0);
             if ui
-                .button("Importar MIDI…")
+                .button("Importar…")
                 .on_hover_text(
-                    "Abrí un archivo MIDI para tocarlo. También podés arrastrarlo a la ventana.",
+                    "Abrí un archivo MIDI o MusicXML para tocarlo. También podés arrastrarlo a la ventana.",
                 )
                 .clicked()
             {
