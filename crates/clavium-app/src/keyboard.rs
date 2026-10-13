@@ -1,5 +1,9 @@
 //! Geometría del teclado en pantalla, en unidades de "ancho de tecla blanca".
 
+/// Rango de un piano de 88 teclas.
+const PIANO_LOWEST: u8 = 21;
+const PIANO_HIGHEST: u8 = 108;
+
 /// Ancho de una tecla negra respecto de una blanca.
 pub const BLACK_WIDTH: f32 = 0.58;
 /// Largo de una tecla negra respecto de una blanca.
@@ -78,6 +82,10 @@ pub struct KeyShape {
 
 #[derive(Debug, Clone)]
 pub struct KeyboardLayout {
+    pub size: KeyboardSize,
+    /// Octavas corridas respecto del rango estándar, como los botones de
+    /// octava de muchos controladores.
+    pub octave_shift: i8,
     pub lowest: u8,
     pub highest: u8,
     /// Primero todas las blancas y después las negras, para dibujarlas en orden.
@@ -87,7 +95,19 @@ pub struct KeyboardLayout {
 
 impl KeyboardLayout {
     pub fn new(size: KeyboardSize) -> Self {
-        let (lowest, highest) = size.range();
+        Self::with_shift(size, 0).expect("el rango estándar entra en el piano")
+    }
+
+    /// Teclado corrido `octave_shift` octavas. `None` si se sale del rango
+    /// de un piano de 88 teclas.
+    pub fn with_shift(size: KeyboardSize, octave_shift: i8) -> Option<Self> {
+        let (low, high) = size.range();
+        let delta = 12 * i16::from(octave_shift);
+        let lowest = u8::try_from(i16::from(low) + delta).ok()?;
+        let highest = u8::try_from(i16::from(high) + delta).ok()?;
+        if lowest < PIANO_LOWEST || highest > PIANO_HIGHEST {
+            return None;
+        }
         let mut whites = Vec::new();
         let mut blacks = Vec::new();
         let mut white_index = 0.0;
@@ -112,12 +132,28 @@ impl KeyboardLayout {
         }
         let white_count = whites.len();
         whites.extend(blacks);
-        KeyboardLayout {
+        Some(KeyboardLayout {
+            size,
+            octave_shift,
             lowest,
             highest,
             keys: whites,
             white_count,
+        })
+    }
+
+    /// El corrimiento más chico que deja `pitch` dentro del teclado, o `None`
+    /// si no entra con ninguno.
+    pub fn shift_to_include(&self, pitch: u8) -> Option<i8> {
+        if self.contains(pitch) {
+            return Some(self.octave_shift);
         }
+        let up = pitch > self.highest;
+        (1..=8i8)
+            .map(|k| self.octave_shift + if up { k } else { -k })
+            .map_while(|s| KeyboardLayout::with_shift(self.size, s))
+            .find(|l| l.contains(pitch))
+            .map(|l| l.octave_shift)
     }
 
     pub fn contains(&self, pitch: u8) -> bool {
@@ -169,6 +205,23 @@ mod tests {
         assert_eq!(layout.key_at(x, 0.9), Some(60));
         assert_eq!(layout.key_at(c4.x + 1.2, 0.9), Some(62));
         assert_eq!(layout.key_at(-1.0, 0.5), None);
+    }
+
+    #[test]
+    fn small_keyboards_follow_the_octave_buttons() {
+        let layout = KeyboardLayout::new(KeyboardSize::Keys49);
+        assert_eq!(layout.shift_to_include(60), Some(0));
+        assert_eq!(layout.shift_to_include(90), Some(1));
+        assert_eq!(layout.shift_to_include(30), Some(-1));
+        assert_eq!(layout.shift_to_include(108), Some(2));
+
+        let shifted = KeyboardLayout::with_shift(KeyboardSize::Keys49, 2).unwrap();
+        assert_eq!((shifted.lowest, shifted.highest), (60, 108));
+        assert!(KeyboardLayout::with_shift(KeyboardSize::Keys49, 3).is_none());
+        assert_eq!(
+            KeyboardLayout::new(KeyboardSize::Keys88).shift_to_include(10),
+            None
+        );
     }
 
     #[test]

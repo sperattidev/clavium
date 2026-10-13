@@ -6,3 +6,10 @@ members = ["crates/*"]
 edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/sperattidev/clavium"
+
+# El audio corre en tiempo real: sin optimizar, el sintetizador se corta.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.clavium-audio]
+opt-level = 3

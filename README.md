@@ -20,11 +20,12 @@ pieza, el mapa de tempo, la importación MIDI, la validación y el formato
 crates/
   clavium-core/   modelo de pieza, mapa de tempo, importación MIDI, formato .clav
   clavium-midi/   detección del teclado, reconexión y entrada en vivo
-  clavium-app/    la app: teclado en pantalla que se ilumina con lo que tocás
+  clavium-audio/  piano interno y salida de audio
+  clavium-app/    la app: teclado en pantalla que se ilumina y suena con lo que tocás
 ```
 
-Los próximos crates (`clavium-eval`, `clavium-audio`, `clavium-render`) se
-suman en las fases siguientes.
+Los próximos crates (`clavium-eval`, `clavium-render`) se suman en las fases
+siguientes.
 
 ## Desarrollo
 

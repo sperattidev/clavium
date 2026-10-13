@@ -1,7 +1,7 @@
 //! Clavium: conectá tu teclado MIDI y tocá.
 //!
 //! Fase 1: detección del teclado, reconexión en caliente y teclado en
-//! pantalla que se ilumina con lo que tocás.
+//! pantalla que se ilumina con lo que tocás. Fase 2: piano interno.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -9,9 +9,12 @@ mod keyboard;
 mod live;
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use clavium_midi::{KeyEvent, MidiEvent, MidiService, PortKind, ServiceConfig, classify_port};
+use clavium_audio::{AudioEngine, Command};
+use clavium_midi::{
+    KeyEvent, MidiEvent, MidiService, PortKind, ServiceConfig, VelocityCurve, classify_port,
+};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
     Vec2,
@@ -30,6 +33,8 @@ const WARN_AMBER: Color32 = Color32::from_rgb(235, 180, 70);
 
 /// Velocity de las notas tocadas con el teclado de la computadora o el mouse.
 const FALLBACK_VELOCITY: u8 = 90;
+/// Espera antes de volver a abrir la salida de audio si falló.
+const AUDIO_RETRY: Duration = Duration::from_secs(2);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -71,6 +76,14 @@ struct ClaviumApp {
     show_diagnostics: bool,
     log: VecDeque<String>,
     started: Instant,
+    audio: Option<AudioEngine>,
+    audio_error: Option<String>,
+    audio_retry_at: Option<Instant>,
+    /// Si el piano interno suena. Se apaga si el teclado tiene sonido propio.
+    sound_on: bool,
+    volume: f32,
+    curve: VelocityCurve,
+    sound_latency: LatencyStats,
 }
 
 impl ClaviumApp {
@@ -79,7 +92,18 @@ impl ClaviumApp {
         let ctx = cc.egui_ctx.clone();
         let midi = MidiService::start(ServiceConfig::default(), move || ctx.request_repaint());
         let size = KeyboardSize::Keys88;
+        let (audio, audio_error) = match AudioEngine::start() {
+            Ok(engine) => (Some(engine), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         ClaviumApp {
+            audio_retry_at: audio_error.as_ref().map(|_| Instant::now() + AUDIO_RETRY),
+            audio,
+            audio_error,
+            sound_on: true,
+            volume: 0.8,
+            curve: VelocityCurve::Normal,
+            sound_latency: LatencyStats::default(),
             midi,
             connection: Connection::Searching { lost: None },
             ports: Vec::new(),
@@ -99,7 +123,64 @@ impl ClaviumApp {
 
     fn press(&mut self, pitch: u8, velocity: u8) {
         self.keys.note_on(pitch, velocity);
-        self.out_of_range = (!self.layout.contains(pitch)).then_some(pitch);
+        self.send_audio(Command::NoteOn { pitch, velocity });
+        // Un teclado chico con los botones de octava corridos: se corre la
+        // pantalla igual que el teclado.
+        self.out_of_range = match self.layout.shift_to_include(pitch) {
+            Some(shift) if shift == self.layout.octave_shift => None,
+            Some(shift) => {
+                if let Some(layout) = KeyboardLayout::with_shift(self.size, shift) {
+                    self.layout = layout;
+                }
+                None
+            }
+            None => Some(pitch),
+        };
+    }
+
+    fn release(&mut self, pitch: u8) {
+        self.keys.note_off(pitch);
+        self.send_audio(Command::NoteOff { pitch });
+    }
+
+    fn set_sustain(&mut self, down: bool) {
+        self.keys.set_sustain(down);
+        self.send_audio(Command::Sustain(down));
+    }
+
+    fn send_audio(&mut self, command: Command) {
+        let silenceable = matches!(command, Command::NoteOn { .. });
+        if let Some(audio) = &mut self.audio
+            && (self.sound_on || !silenceable)
+        {
+            audio.send(command);
+        }
+    }
+
+    fn update_audio(&mut self) {
+        if let Some(audio) = &mut self.audio {
+            for ms in audio.drain_latencies() {
+                self.sound_latency.record(ms);
+            }
+            if audio.has_failed() {
+                self.audio = None;
+                self.audio_error = Some("Se perdió la salida de audio".to_string());
+                self.audio_retry_at = Some(Instant::now() + AUDIO_RETRY);
+            }
+        } else if self.audio_retry_at.is_some_and(|t| Instant::now() >= t) {
+            match AudioEngine::start() {
+                Ok(engine) => {
+                    engine.set_volume(self.volume);
+                    self.audio = Some(engine);
+                    self.audio_error = None;
+                    self.audio_retry_at = None;
+                }
+                Err(e) => {
+                    self.audio_error = Some(e.to_string());
+                    self.audio_retry_at = Some(Instant::now() + AUDIO_RETRY);
+                }
+            }
+        }
     }
 
     fn push_log(&mut self, line: String) {
@@ -120,6 +201,7 @@ impl ClaviumApp {
                 MidiEvent::Disconnected { port } => {
                     self.push_log(format!("desconectado: {port}"));
                     self.keys.release_all();
+                    self.send_audio(Command::AllNotesOff);
                     self.connection = Connection::Searching { lost: Some(port) };
                 }
                 MidiEvent::ConnectFailed { port, reason } => {
@@ -128,13 +210,14 @@ impl ClaviumApp {
                 }
                 MidiEvent::Key { event, at } => match event {
                     KeyEvent::NoteOn { pitch, velocity } => {
-                        self.press(pitch, velocity);
+                        let curved = self.curve.apply(velocity);
+                        self.press(pitch, curved);
                         self.pending.push(at);
-                        self.push_log(format!("{} vel {velocity}", note_name(pitch)));
+                        self.push_log(format!("{} vel {velocity} → {curved}", note_name(pitch)));
                     }
-                    KeyEvent::NoteOff { pitch } => self.keys.note_off(pitch),
+                    KeyEvent::NoteOff { pitch } => self.release(pitch),
                     KeyEvent::Sustain { down } => {
-                        self.keys.set_sustain(down);
+                        self.set_sustain(down);
                         self.push_log(format!("pedal {}", if down { "abajo" } else { "arriba" }));
                     }
                 },
@@ -173,7 +256,7 @@ impl ClaviumApp {
                 if pressed {
                     self.press(pitch, FALLBACK_VELOCITY);
                 } else {
-                    self.keys.note_off(pitch);
+                    self.release(pitch);
                 }
             }
         }
@@ -204,6 +287,8 @@ impl ClaviumApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.toggle_value(&mut self.show_diagnostics, "Diagnóstico");
+                ui.separator();
+
                 let before = self.size;
                 egui::ComboBox::from_id_salt("keyboard-size")
                     .selected_text(self.size.label())
@@ -217,6 +302,42 @@ impl ClaviumApp {
                     self.out_of_range = None;
                 }
                 ui.label("Tu teclado:");
+                ui.separator();
+
+                egui::ComboBox::from_id_salt("velocity-curve")
+                    .selected_text(self.curve.label())
+                    .show_ui(ui, |ui| {
+                        for curve in VelocityCurve::ALL {
+                            ui.selectable_value(&mut self.curve, curve, curve.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Liviana: con poca fuerza ya suena fuerte. Probala si tu teclado suena muy bajo.",
+                    );
+                ui.label("Sensibilidad:");
+                ui.separator();
+
+                if self.audio.is_some() {
+                    let slider = ui.add_enabled(
+                        self.sound_on,
+                        egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false),
+                    );
+                    if slider.changed()
+                        && let Some(audio) = &self.audio
+                    {
+                        audio.set_volume(self.volume);
+                    }
+                    let toggle = ui
+                        .checkbox(&mut self.sound_on, "Sonido")
+                        .on_hover_text("Apagalo si tu teclado tiene sonido propio.");
+                    if toggle.changed() && !self.sound_on {
+                        self.send_audio(Command::AllNotesOff);
+                    }
+                } else {
+                    ui.label(RichText::new("Sin salida de audio").color(WARN_AMBER))
+                        .on_hover_text(self.audio_error.clone().unwrap_or_default());
+                }
             });
         });
     }
@@ -278,7 +399,7 @@ impl ClaviumApp {
         };
         if target != self.mouse_note {
             if let Some(old) = self.mouse_note {
-                self.keys.note_off(old);
+                self.release(old);
             }
             if let Some(new) = target {
                 self.press(new, FALLBACK_VELOCITY);
@@ -353,7 +474,7 @@ impl ClaviumApp {
                     ui.label(format!("{port}  ({kind}{state})"));
                 }
                 ui.separator();
-                ui.heading("Latencia");
+                ui.heading("Latencia de pantalla");
                 match (self.latency.mean(), self.latency.max()) {
                     (Some(mean), Some(max)) => ui.label(format!(
                         "De la llegada de la nota al cuadro que la muestra: media {mean:.1} ms, máxima {max:.1} ms ({} notas). \
@@ -362,6 +483,38 @@ impl ClaviumApp {
                     )),
                     _ => ui.label("Tocá algunas notas en el teclado MIDI para medir."),
                 };
+                ui.separator();
+                ui.heading("Audio");
+                match &self.audio {
+                    Some(audio) => {
+                        let info = audio.info();
+                        let buffer = match info.buffer_frames {
+                            Some(frames) => format!(
+                                "buffer de {frames} muestras ({:.1} ms)",
+                                frames as f32 * 1000.0 / info.sample_rate as f32
+                            ),
+                            None => "buffer elegido por el sistema".to_string(),
+                        };
+                        ui.label(format!(
+                            "{}: {} Hz, {} canales, {buffer}",
+                            info.device, info.sample_rate, info.channels
+                        ));
+                        match (self.sound_latency.mean(), self.sound_latency.max()) {
+                            (Some(mean), Some(max)) => ui.label(format!(
+                                "De la tecla al sonido: media {mean:.1} ms, máxima {max:.1} ms ({} notas). \
+                                 Incluye la espera del buffer y la salida de la placa.",
+                                self.sound_latency.count()
+                            )),
+                            _ => ui.label("Tocá algunas notas con el sonido activado para medir."),
+                        };
+                    }
+                    None => {
+                        ui.label(format!(
+                            "Sin salida de audio: {}. Clavium lo vuelve a intentar solo.",
+                            self.audio_error.as_deref().unwrap_or("error desconocido")
+                        ));
+                    }
+                }
                 ui.separator();
                 ui.heading("Últimos eventos");
                 for line in &self.log {
@@ -376,6 +529,13 @@ impl eframe::App for ClaviumApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_midi();
         self.handle_computer_keyboard(ctx);
+        self.update_audio();
+        if self.audio.is_none() {
+            ctx.request_repaint_after(AUDIO_RETRY);
+        } else if self.show_diagnostics {
+            // Las mediciones de audio llegan después de la nota.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

@@ -6,5 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+clavium-audio = { version = "0.1.0", path = "../clavium-audio" }
 clavium-midi = { version = "0.1.0", path = "../clavium-midi" }
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts"] }
