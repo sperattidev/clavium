@@ -1,0 +1,9 @@
+# Rutas de aprendizaje: cada ruta lista las piezas en el orden recomendado,
+# por el nombre de su archivo sin ".txt". Una pieza puede no estar en ninguna.
+
+ruta: Primeros pasos
+- estrellita
+- oda-a-la-alegria
+
+ruta: Dos manos
+- minueto-en-sol

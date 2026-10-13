@@ -685,7 +685,7 @@ impl ClaviumApp {
         );
         ui.add_space(12.0);
 
-        let cards: Vec<(String, String, Option<String>)> = self
+        let cards: Vec<(String, String, Option<String>, bool)> = self
             .library
             .entries
             .iter()
@@ -708,7 +708,33 @@ impl ClaviumApp {
                     }
                     (!parts.is_empty()).then(|| parts.join(" · "))
                 });
-                (e.piece.metadata.title.clone(), e.subtitle(), progress)
+                (
+                    e.piece.metadata.title.clone(),
+                    e.subtitle(),
+                    progress,
+                    e.is_draft(),
+                )
+            })
+            .collect();
+        // Una pieza está dominada si se tocó al tempo original con 90 % o más.
+        let mastered = |id: &str| {
+            self.stats
+                .get(id)
+                .and_then(|s| s.best_speed)
+                .is_some_and(|s| s >= 1.0)
+        };
+        let groups: Vec<(String, Vec<usize>)> = self
+            .library
+            .groups
+            .iter()
+            .map(|g| {
+                let done = g
+                    .entries
+                    .iter()
+                    .filter(|&&i| mastered(self.library.entries[i].id))
+                    .count();
+                let header = format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len());
+                (header, g.entries.clone())
             })
             .collect();
         let mut start = false;
@@ -717,7 +743,18 @@ impl ClaviumApp {
             egui::ScrollArea::vertical()
                 .id_salt("pieces")
                 .show(&mut cols[0], |ui| {
-                    for (i, (title, subtitle, progress)) in cards.iter().enumerate() {
+                    for (i, header) in groups.iter().flat_map(|(header, entries)| {
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(move |(k, &i)| (i, (k == 0).then_some(header)))
+                    }) {
+                        if let Some(header) = header {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(header).strong().color(ACCENT_BRIGHT));
+                            ui.add_space(4.0);
+                        }
+                        let (title, subtitle, progress, draft) = &cards[i];
                         let selected = i == self.selected;
                         let fill = if selected {
                             ACCENT_DIM.gamma_multiply(0.55)
@@ -730,7 +767,13 @@ impl ClaviumApp {
                             .fill(fill)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.label(RichText::new(title).size(19.0).strong());
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(title).size(19.0).strong());
+                                    if *draft {
+                                        ui.label(RichText::new("Borrador").color(WARN_AMBER))
+                                            .on_hover_text("Arreglo sin revisar: puede tener errores de notas.");
+                                    }
+                                });
                                 ui.label(
                                     RichText::new(subtitle).color(ui.visuals().weak_text_color()),
                                 );

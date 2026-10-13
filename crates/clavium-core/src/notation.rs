@@ -8,6 +8,7 @@
 //! tempo: 100
 //! time: 4/4
 //! section: Frase A 1-4
+//! reviewer: Matías, 2026-10-13
 //! right: E4 E4 F4 G4 | G4 F4 E4 D4
 //! left:  C3:4        | G2:4
 //! ```
@@ -18,6 +19,8 @@
 //! notas en un acorde (`C3+E3+G3:2`). Las barras `|` y los fines de línea
 //! cierran compases, y se verifica que cada uno sume lo que indica la cifra
 //! de compás. Las líneas `right:` y `left:` pueden repetirse y se concatenan.
+//! Cada `reviewer:` registra a alguien que revisó el arreglo tocándolo; sin
+//! revisores la pieza es un borrador.
 
 use crate::model::{
     Arrangement, Confidence, Hand, Metadata, Note, Piece, Provenance, Section, TimeSignature,
@@ -50,6 +53,7 @@ pub fn parse_piece(text: &str) -> Result<Piece, NotationError> {
     let mut time = (4u8, 4u8);
     let mut source = None;
     let mut license = None;
+    let mut reviewers = Vec::new();
     let mut sections = Vec::new();
     let mut right = Vec::new();
     let mut left = Vec::new();
@@ -109,6 +113,7 @@ pub fn parse_piece(text: &str) -> Result<Piece, NotationError> {
             }
             "source" => source = Some(value.to_string()),
             "license" => license = Some(value.to_string()),
+            "reviewer" => reviewers.push(value.to_string()),
             "section" => sections.push((value.to_string(), line_no)),
             "right" => right.push((value.to_string(), line_no)),
             "left" => left.push((value.to_string(), line_no)),
@@ -152,14 +157,14 @@ pub fn parse_piece(text: &str) -> Result<Piece, NotationError> {
                 .map_err(|message| NotationError::Syntax { line, message })?,
         );
     }
-    if source.is_some() || license.is_some() {
+    if source.is_some() || license.is_some() || !reviewers.is_empty() {
         piece.provenance = Some(Provenance {
             source: source.unwrap_or_else(|| "sin indicar".into()),
             edition: None,
             license: license.unwrap_or_else(|| "sin indicar".into()),
             file_sha256: None,
             confidence: Confidence::A,
-            reviewers: Vec::new(),
+            reviewers,
         });
     }
     piece.notes = notes;
