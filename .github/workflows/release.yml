@@ -18,6 +18,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: La etiqueta coincide con la versión del código
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' crates/clavium-app/Cargo.toml | cut -d'"' -f2)
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "La etiqueta $GITHUB_REF_NAME no coincide con la versión $VERSION de clavium-app"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p clavium-app

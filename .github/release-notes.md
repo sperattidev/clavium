@@ -11,3 +11,5 @@ Conectá tu teclado MIDI, elegí una pieza y tocá: Clavium evalúa cada nota.
 
 Dentro de la app se descargan aparte el piano Yamaha C5 y la biblioteca
 ampliada de obras completas. Ver CREDITOS.md.
+
+Ver la [política de firma de código, privacidad y desinstalación](https://github.com/sperattidev/clavium#code-signing-policy).

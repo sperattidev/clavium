@@ -21,3 +21,6 @@ zip = "9.0.2"
 [dev-dependencies]
 hound = "3.5.1"
 midly = "0.5.3"
+
+[build-dependencies]
+winresource = "0.1.34"

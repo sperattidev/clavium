@@ -97,3 +97,36 @@ descarga está en `docs/` para GitHub Pages. Los créditos están en
 
 Pendiente para distribuir sin advertencias: firma de código en Windows y firma
 y notarización en macOS (requieren certificados del desarrollador).
+
+## Code signing policy
+
+Política de firma de código de Clavium.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+La firma de los ejecutables de Windows está en trámite con SignPath Foundation;
+mientras tanto, las versiones publicadas no están firmadas.
+
+Solo se firman los ejecutables que arma el flujo `Versión` de GitHub Actions a
+partir del código de este repositorio, y cada firma se aprueba a mano.
+
+**Roles del equipo**
+
+- Autores (commits con acceso de escritura): [Matias Speratti (@sperattidev)](https://github.com/sperattidev)
+- Revisores (revisan los cambios de personas sin acceso de escritura): [Matias Speratti (@sperattidev)](https://github.com/sperattidev)
+- Aprobadores (aprueban cada pedido de firma): [Matias Speratti (@sperattidev)](https://github.com/sperattidev)
+
+**Privacidad**
+
+Clavium no transfiere información a otros sistemas en red salvo que el usuario
+lo pida: solo se conecta para descargar, cuando el usuario lo elige, la
+biblioteca ampliada (desde GitHub Releases) y el piano Yamaha C5 (desde el
+repositorio de sfzinstruments en GitHub). No tiene telemetría ni cuentas. El
+progreso, las preferencias, las piezas importadas y las descargas se guardan
+solo en la computadora del usuario.
+
+**Desinstalar**
+
+Clavium no se instala en el sistema: basta con borrar la carpeta de la app (en
+macOS, `Clavium.app`). Para borrar también el progreso y las descargas, borrar
+`%APPDATA%\Clavium` en Windows o `~/Library/Application Support/Clavium` en
+macOS.
