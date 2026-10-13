@@ -1,13 +1,11 @@
 //! Conversión de un MIDI de partitura en una pieza de Clavium lista para el
 //! catálogo: metadatos, procedencia, dificultad y secciones para practicar.
 
-use clavium_core::analysis::estimate_level;
+use clavium_core::analysis::{auto_sections, estimate_level};
 use clavium_core::midi::import_smf;
 use clavium_core::validate::{IssueKind, Severity, validate};
-use clavium_core::{Arrangement, Confidence, Metadata, Piece, Provenance, Section};
+use clavium_core::{Arrangement, Confidence, Metadata, Piece, Provenance};
 
-/// Compases por sección automática, para practicar obras largas por partes.
-pub const BARS_PER_SECTION: usize = 8;
 /// Menos notas que esto no es una obra para practicar (o el MIDI está vacío).
 const MIN_NOTES: usize = 16;
 
@@ -65,25 +63,6 @@ pub fn convert(midi: &[u8], source: &Source<'_>) -> Result<Piece, String> {
         ));
     }
     Ok(piece)
-}
-
-/// Secciones de `BARS_PER_SECTION` compases: "Compases 1–8", "Compases 9–16"…
-pub fn auto_sections(piece: &Piece) -> Vec<Section> {
-    let bars = piece.bar_ticks();
-    let end = piece.end_tick();
-    bars.chunks(BARS_PER_SECTION)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let first = i * BARS_PER_SECTION + 1;
-            let last = first + chunk.len() - 1;
-            let next = bars.get((i + 1) * BARS_PER_SECTION).copied().unwrap_or(end);
-            Section {
-                name: format!("Compases {first}–{last}"),
-                start_tick: chunk[0],
-                end_tick: next,
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

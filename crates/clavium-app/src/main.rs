@@ -12,6 +12,7 @@ mod instruments;
 mod keyboard;
 mod library;
 mod live;
+mod mine;
 mod session;
 mod store;
 
@@ -31,6 +32,7 @@ use eframe::egui::{
 };
 
 use calibration::Calibration;
+use clavium_core::midi::PartHand;
 use clavium_eval::{HandFilter, PracticeMode, Summary};
 use instruments::{Quality, SALAMANDER};
 use keyboard::{BLACK_LENGTH, KeyboardLayout, KeyboardSize, note_name};
@@ -70,6 +72,29 @@ fn main() -> eframe::Result {
             ),
             Err(e) => {
                 eprintln!("No se pudo instalar el catálogo: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    // `clavium-app --importar archivo.mid` lo suma a Mis piezas con las partes sugeridas.
+    if let [flag, path] = args.as_slice()
+        && flag == "--importar"
+    {
+        let result = mine::PendingImport::open(std::path::Path::new(path)).and_then(|p| {
+            p.build()
+                .and_then(|piece| p.save(&piece).map(|id| (id, piece)))
+        });
+        match result {
+            Ok((id, piece)) => println!(
+                "Importada como {id}: {} ({} notas, nivel {}, {} secciones)",
+                piece.metadata.title,
+                piece.notes.len(),
+                piece.metadata.difficulty.unwrap_or(1),
+                piece.sections.len()
+            ),
+            Err(e) => {
+                eprintln!("No se pudo importar: {e}");
                 std::process::exit(1);
             }
         }
@@ -208,6 +233,10 @@ struct ClaviumApp {
     download: Option<Receiver<Result<usize, String>>>,
     /// Aviso para mostrar en la biblioteca (descargas, errores al abrir).
     library_message: Option<String>,
+    /// MIDI abierto esperando que se elijan sus partes.
+    pending_import: Option<mine::PendingImport>,
+    /// Pieza propia a punto de quitarse (pide confirmación).
+    confirm_remove: Option<String>,
     screen: Screen,
     selected: usize,
     options: PlayOptions,
@@ -264,7 +293,7 @@ impl ClaviumApp {
             prompt_dismissed: setting("salamander_prompt").is_some_and(|v| v == "dismissed"),
         };
         let reviewer_name = setting("reviewer_name").unwrap_or_default();
-        let mut library = Library::load(&catalog::default_dir());
+        let mut library = Library::load(&catalog::default_dir(), &mine::dir());
         apply_local_reviews(&mut library, store.as_ref());
         let stats = load_stats(&library, store.as_ref());
 
@@ -308,6 +337,8 @@ impl ClaviumApp {
             reviewer_name,
             download: None,
             library_message: None,
+            pending_import: None,
+            confirm_remove: None,
             screen: Screen::Library,
             selected: 0,
             options: PlayOptions::default(),
@@ -518,7 +549,7 @@ impl ClaviumApp {
             .entries
             .get(self.selected)
             .map(|e| e.id.clone());
-        self.library = Library::load(&catalog::default_dir());
+        self.library = Library::load(&catalog::default_dir(), &mine::dir());
         apply_local_reviews(&mut self.library, self.store.as_ref());
         self.stats = load_stats(&self.library, self.store.as_ref());
         self.selected = selected_id
@@ -539,14 +570,166 @@ impl ClaviumApp {
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
-                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("zip")))
                 .collect()
         });
+        let extension = |p: &PathBuf| {
+            p.extension()
+                .map(|x| x.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        };
         if let Some(path) = dropped.first() {
-            let result = std::fs::read(path)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| catalog::install_zip(&bytes, &catalog::default_dir()));
-            self.finish_install(result);
+            match extension(path).as_str() {
+                "zip" => {
+                    let result = std::fs::read(path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| catalog::install_zip(&bytes, &catalog::default_dir()));
+                    self.finish_install(result);
+                }
+                "mid" | "midi" => self.open_midi(path),
+                _ => {
+                    self.library_message = Some(
+                        "Se pueden arrastrar archivos MIDI (.mid) o paquetes de catálogo (.zip)."
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Abre un MIDI para elegir qué partes importar.
+    fn open_midi(&mut self, path: &std::path::Path) {
+        match mine::PendingImport::open(path) {
+            Ok(pending) => {
+                self.pending_import = Some(pending);
+                self.screen_to_library();
+            }
+            Err(e) => self.library_message = Some(format!("No se pudo abrir el MIDI: {e}")),
+        }
+    }
+
+    fn pick_midi(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Importar un archivo MIDI")
+            .add_filter("Archivos MIDI", &["mid", "midi"])
+            .pick_file()
+        {
+            self.open_midi(&path);
+        }
+    }
+
+    /// Si se está tocando, vuelve a la biblioteca para mostrar el diálogo.
+    fn screen_to_library(&mut self) {
+        if !matches!(self.screen, Screen::Library) {
+            self.leave_session();
+            self.screen = Screen::Library;
+        }
+    }
+
+    /// Diálogo para elegir las partes del MIDI y con qué mano se tocan.
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &mut self.pending_import else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Importar MIDI")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Título:");
+                    ui.add(egui::TextEdit::singleline(&mut pending.title).desired_width(320.0));
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Elegí qué partes querés tocar. En los MIDI de canciones suele haber batería, \
+                         bajo y voz además del piano.",
+                    )
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    egui::Grid::new("parts")
+                        .num_columns(4)
+                        .spacing([12.0, 6.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Tocar").strong());
+                            ui.label(RichText::new("Parte").strong());
+                            ui.label(RichText::new("Notas").strong());
+                            ui.label(RichText::new("Mano").strong());
+                            ui.end_row();
+                            for (i, part) in pending.parts.iter().enumerate() {
+                                let (on, hand) = &mut pending.choices[i];
+                                ui.checkbox(on, "");
+                                let name = if part.name.is_empty() {
+                                    format!("Pista {}", part.track + 1)
+                                } else {
+                                    part.name.clone()
+                                };
+                                ui.label(format!(
+                                    "{name} · {} ({}–{})",
+                                    part.instrument(),
+                                    note_name(part.lowest),
+                                    note_name(part.highest)
+                                ));
+                                ui.label(part.notes.to_string());
+                                ui.add_enabled_ui(*on, |ui| {
+                                    egui::ComboBox::from_id_salt(("hand", i))
+                                        .selected_text(hand_label(*hand))
+                                        .show_ui(ui, |ui| {
+                                            for h in [PartHand::Auto, PartHand::Right, PartHand::Left, PartHand::Split] {
+                                                ui.selectable_value(hand, h, hand_label(h));
+                                            }
+                                        });
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.add_space(8.0);
+                ui.label(format!("{} notas elegidas.", pending.selected_notes()));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Importar").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "La pieza se guarda solo en esta computadora. Usá archivos que tengas \
+                         derecho a usar.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+
+        if confirm {
+            let result = pending.build().and_then(|piece| pending.save(&piece));
+            match result {
+                Ok(id) => {
+                    self.pending_import = None;
+                    self.reload_library();
+                    if let Some(i) = self.library.entries.iter().position(|e| e.id == id) {
+                        self.selected = i;
+                    }
+                    self.options.section = None;
+                    self.library_message = Some("Pieza importada en Mis piezas.".into());
+                }
+                Err(e) => self.library_message = Some(format!("No se pudo importar: {e}")),
+            }
+        } else if cancel || !open {
+            self.pending_import = None;
         }
     }
 
@@ -1038,6 +1221,16 @@ impl ClaviumApp {
             if !self.filter.query.is_empty() && ui.button("Borrar").clicked() {
                 self.filter.query.clear();
             }
+            ui.add_space(16.0);
+            if ui
+                .button("Importar MIDI…")
+                .on_hover_text(
+                    "Abrí un archivo MIDI para tocarlo. También podés arrastrarlo a la ventana.",
+                )
+                .clicked()
+            {
+                self.pick_midi();
+            }
         });
         ui.add_space(6.0);
         self.piano_banner(ui);
@@ -1076,9 +1269,18 @@ impl ClaviumApp {
                         .count();
                     format!("{}  ·  {done} de {} dominadas", g.name, g.entries.len())
                 } else {
-                    format!("{}  ·  {} obras", g.name, g.entries.len())
+                    let n = g.entries.len();
+                    format!(
+                        "{}  ·  {n} {}",
+                        g.name,
+                        if n == 1 { "obra" } else { "obras" }
+                    )
                 };
-                (header, g.entries, g.is_route || open_all)
+                (
+                    header,
+                    g.entries,
+                    g.is_route || open_all || g.name == library::MY_PIECES,
+                )
             })
             .collect();
         let mut start = false;
@@ -1250,6 +1452,39 @@ impl ClaviumApp {
                 self.filter = default;
             }
         });
+    }
+
+    /// Quitar una pieza importada de "Mis piezas", con confirmación.
+    fn remove_box(&mut self, ui: &mut egui::Ui) {
+        let Some(entry) = self.library.entries.get(self.selected) else {
+            return;
+        };
+        if !entry.mine {
+            return;
+        }
+        let id = entry.id.clone();
+        ui.add_space(12.0);
+        if self.confirm_remove.as_deref() == Some(id.as_str()) {
+            ui.label("¿Quitar esta pieza de Mis piezas? El archivo MIDI original no se borra.");
+            ui.horizontal(|ui| {
+                if ui.button("Sí, quitarla").clicked() {
+                    match mine::remove(&id) {
+                        Ok(()) => {
+                            self.confirm_remove = None;
+                            self.reload_library();
+                            self.selected = 0;
+                            self.library_message = Some("Pieza quitada de Mis piezas.".into());
+                        }
+                        Err(e) => self.library_message = Some(format!("No se pudo quitar: {e}")),
+                    }
+                }
+                if ui.button("Cancelar").clicked() {
+                    self.confirm_remove = None;
+                }
+            });
+        } else if ui.small_button("Quitar de Mis piezas").clicked() {
+            self.confirm_remove = Some(id);
+        }
     }
 
     /// Revisión de la pieza elegida: quien la toca completa y comprueba que
@@ -1466,6 +1701,7 @@ impl ClaviumApp {
             );
         }
         self.review_box(ui);
+        self.remove_box(ui);
         if let Some(message) = &self.library_message {
             ui.add_space(8.0);
             ui.label(RichText::new(message).color(WARN_AMBER));
@@ -2117,6 +2353,8 @@ impl eframe::App for ClaviumApp {
             let ctx = ui.ctx().clone();
             self.diagnostics(&ctx);
         }
+        let ctx = ui.ctx().clone();
+        self.import_dialog(&ctx);
 
         let now = Instant::now();
         for at in self.pending.drain(..) {
@@ -2173,6 +2411,15 @@ fn progress_text(stats: &PieceStats) -> Option<String> {
         parts.push(format!("{} {plural}", stats.sessions));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn hand_label(hand: PartHand) -> &'static str {
+    match hand {
+        PartHand::Auto => "Automática",
+        PartHand::Right => "Derecha",
+        PartHand::Left => "Izquierda",
+        PartHand::Split => "Según la altura",
+    }
 }
 
 fn curve_key(curve: VelocityCurve) -> &'static str {

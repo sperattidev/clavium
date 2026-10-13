@@ -12,7 +12,11 @@ clavium-eval = { version = "0.1.0", path = "../clavium-eval" }
 clavium-midi = { version = "0.1.0", path = "../clavium-midi" }
 dirs = "7.0.0"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts"] }
+rfd = "0.17.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde_json = "1.0.154"
 ureq = "3.4.2"
 zip = "9.0.2"
+
+[dev-dependencies]
+midly = "0.5.3"

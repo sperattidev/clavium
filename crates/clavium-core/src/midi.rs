@@ -31,10 +31,101 @@ pub enum MidiImportError {
     Tempo(#[from] TempoError),
 }
 
-/// Importa un archivo MIDI. La pieza resultante queda con procedencia de
-/// nivel D (sin verificar) y el hash del archivo; el pipeline de catálogo la
-/// reemplaza cuando la pieza se revisa.
-pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
+/// Una parte de un archivo MIDI: las notas de un canal dentro de una pista.
+/// Un MIDI de una canción suele tener una parte por instrumento.
+pub type PartId = (usize, u8);
+
+/// Canal MIDI de la batería en General MIDI (el 10, contando desde 1).
+const DRUM_CHANNEL: u8 = 9;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiPart {
+    pub track: usize,
+    pub channel: u8,
+    /// Nombre de la pista, si tiene.
+    pub name: String,
+    /// Programa General MIDI (0 = piano de cola), si el archivo lo indica.
+    pub program: Option<u8>,
+    pub drums: bool,
+    pub notes: usize,
+    pub lowest: u8,
+    pub highest: u8,
+}
+
+impl MidiPart {
+    pub fn id(&self) -> PartId {
+        (self.track, self.channel)
+    }
+
+    /// Piano o teclado, según el programa o el nombre de la pista.
+    pub fn is_piano(&self) -> bool {
+        let name = self.name.to_lowercase();
+        !self.drums
+            && (self.program.is_some_and(|p| p < 8)
+                || name.contains("piano")
+                || name.contains("keys")
+                || name.contains("teclado"))
+    }
+
+    /// Familia de instrumento de General MIDI, para mostrar en castellano.
+    pub fn instrument(&self) -> &'static str {
+        if self.drums {
+            return "Batería";
+        }
+        const FAMILIES: [&str; 16] = [
+            "Piano",
+            "Percusión afinada",
+            "Órgano",
+            "Guitarra",
+            "Bajo",
+            "Cuerdas",
+            "Ensamble",
+            "Metales",
+            "Lengüetas",
+            "Vientos",
+            "Sintetizador",
+            "Sintetizador (colchón)",
+            "Efectos de sintetizador",
+            "Instrumentos étnicos",
+            "Percusión",
+            "Efectos de sonido",
+        ];
+        self.program.map_or("Instrumento sin indicar", |p| {
+            FAMILIES[usize::from(p / 8).min(15)]
+        })
+    }
+}
+
+/// Mano para las notas de una parte al importar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartHand {
+    /// Se decide entre las partes en automático: las agudas a la derecha.
+    #[default]
+    Auto,
+    Right,
+    Left,
+    /// Cada nota según su altura, dividiendo en el Do central.
+    Split,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartChoice {
+    pub part: PartId,
+    pub hand: PartHand,
+}
+
+struct Parsed {
+    ppq: u16,
+    tempo_changes: Vec<TempoChange>,
+    time_signatures: Vec<TimeSignature>,
+    title: Option<String>,
+    notes: Vec<(PartId, Note)>,
+    sustain: Vec<PedalSpan>,
+    track_names: HashMap<usize, String>,
+    programs: HashMap<PartId, u8>,
+}
+
+fn parse(bytes: &[u8]) -> Result<Parsed, MidiImportError> {
     let smf = Smf::parse(bytes)?;
     if smf.header.format == Format::Sequential {
         return Err(MidiImportError::UnsupportedFormat);
@@ -44,12 +135,16 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
         Timing::Timecode(..) => return Err(MidiImportError::UnsupportedTiming),
     };
 
-    let mut tempo_changes = Vec::new();
-    let mut time_signatures = Vec::new();
-    let mut title: Option<String> = None;
-    // (pista, nota)
-    let mut notes: Vec<(usize, Note)> = Vec::new();
-    let mut sustain = Vec::new();
+    let mut parsed = Parsed {
+        ppq,
+        tempo_changes: Vec::new(),
+        time_signatures: Vec::new(),
+        title: None,
+        notes: Vec::new(),
+        sustain: Vec::new(),
+        track_names: HashMap::new(),
+        programs: HashMap::new(),
+    };
     let mut pedal_down: Option<u64> = None;
     let mut last_tick = 0;
 
@@ -61,35 +156,44 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
         for event in track {
             tick += u64::from(event.delta.as_int());
             match event.kind {
-                TrackEventKind::Meta(MetaMessage::Tempo(us)) => tempo_changes.push(TempoChange {
-                    tick,
-                    us_per_quarter: us.as_int(),
-                }),
+                TrackEventKind::Meta(MetaMessage::Tempo(us)) => {
+                    parsed.tempo_changes.push(TempoChange {
+                        tick,
+                        us_per_quarter: us.as_int(),
+                    })
+                }
                 TrackEventKind::Meta(MetaMessage::TimeSignature(num, den_pow, _, _)) => {
                     if num > 0 && den_pow <= 6 {
-                        time_signatures.push(TimeSignature {
+                        parsed.time_signatures.push(TimeSignature {
                             tick,
                             numerator: num,
                             denominator: 1 << den_pow,
                         });
                     }
                 }
-                TrackEventKind::Meta(MetaMessage::TrackName(name)) if title.is_none() => {
+                TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                     let name = String::from_utf8_lossy(name).trim().to_string();
                     if !name.is_empty() {
-                        title = Some(name);
+                        if parsed.title.is_none() {
+                            parsed.title = Some(name.clone());
+                        }
+                        parsed.track_names.entry(track_index).or_insert(name);
                     }
                 }
                 TrackEventKind::Midi { channel, message } => {
                     let channel = channel.as_int();
+                    let part = (track_index, channel);
                     match message {
+                        MidiMessage::ProgramChange { program } => {
+                            parsed.programs.entry(part).or_insert(program.as_int());
+                        }
                         MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
                             let key = key.as_int();
                             // Una tecla que se vuelve a tocar sin soltarse cierra la anterior.
                             if let Some((start, velocity)) = open.remove(&(channel, key))
                                 && start < tick
                             {
-                                notes.push((track_index, note(key, velocity, start, tick)));
+                                parsed.notes.push((part, note(key, velocity, start, tick)));
                             }
                             open.insert((channel, key), (tick, vel.as_int()));
                         }
@@ -97,7 +201,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
                         MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
                             let key = key.as_int();
                             if let Some((start, velocity)) = open.remove(&(channel, key)) {
-                                notes.push((track_index, note(key, velocity, start, tick)));
+                                parsed.notes.push((part, note(key, velocity, start, tick)));
                             }
                         }
                         MidiMessage::Controller { controller, value }
@@ -108,7 +212,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
                                 (true, None) => pedal_down = Some(tick),
                                 (false, Some(start)) => {
                                     if start < tick {
-                                        sustain.push(PedalSpan {
+                                        parsed.sustain.push(PedalSpan {
                                             start_tick: start,
                                             end_tick: tick,
                                         });
@@ -126,8 +230,10 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
         }
 
         // Notas que nunca se soltaron terminan al final de su pista.
-        for ((_, key), (start, velocity)) in open {
-            notes.push((track_index, note(key, velocity, start, tick)));
+        for ((channel, key), (start, velocity)) in open {
+            parsed
+                .notes
+                .push(((track_index, channel), note(key, velocity, start, tick)));
         }
         last_tick = last_tick.max(tick);
     }
@@ -135,19 +241,111 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
     if let Some(start) = pedal_down
         && start < last_tick
     {
-        sustain.push(PedalSpan {
+        parsed.sustain.push(PedalSpan {
             start_tick: start,
             end_tick: last_tick,
         });
     }
-    sustain.sort_by_key(|p| p.start_tick);
-    time_signatures.sort_by_key(|s| s.tick);
+    parsed.sustain.sort_by_key(|p| p.start_tick);
+    parsed.time_signatures.sort_by_key(|s| s.tick);
+    Ok(parsed)
+}
 
-    assign_hands_by_track(&mut notes);
+/// Las partes del archivo que tienen notas, en el orden de sus pistas.
+pub fn inspect_parts(bytes: &[u8]) -> Result<Vec<MidiPart>, MidiImportError> {
+    let parsed = parse(bytes)?;
+    let mut parts: Vec<MidiPart> = Vec::new();
+    for (id, n) in &parsed.notes {
+        match parts.iter_mut().find(|p| p.id() == *id) {
+            Some(p) => {
+                p.notes += 1;
+                p.lowest = p.lowest.min(n.pitch);
+                p.highest = p.highest.max(n.pitch);
+            }
+            None => parts.push(MidiPart {
+                track: id.0,
+                channel: id.1,
+                name: parsed.track_names.get(&id.0).cloned().unwrap_or_default(),
+                program: parsed.programs.get(id).copied(),
+                drums: id.1 == DRUM_CHANNEL,
+                notes: 1,
+                lowest: n.pitch,
+                highest: n.pitch,
+            }),
+        }
+    }
+    parts.sort_by_key(|p| (p.track, p.channel));
+    Ok(parts)
+}
+
+/// Las partes que conviene marcar al abrir el archivo: las de piano si hay;
+/// si no, todas menos la batería.
+pub fn default_choices(parts: &[MidiPart]) -> Vec<PartChoice> {
+    let piano: Vec<&MidiPart> = parts.iter().filter(|p| p.is_piano()).collect();
+    let chosen: Vec<&MidiPart> = if piano.is_empty() {
+        parts.iter().filter(|p| !p.drums).collect()
+    } else {
+        piano
+    };
+    chosen
+        .into_iter()
+        .map(|p| PartChoice {
+            part: p.id(),
+            hand: PartHand::Auto,
+        })
+        .collect()
+}
+
+/// Importa un archivo MIDI completo, sin la batería. La pieza resultante queda
+/// con procedencia de nivel D (sin verificar) y el hash del archivo; el
+/// pipeline de catálogo la reemplaza cuando la pieza se revisa.
+pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
+    let choices: Vec<PartChoice> = inspect_parts(bytes)?
+        .iter()
+        .filter(|p| !p.drums)
+        .map(|p| PartChoice {
+            part: p.id(),
+            hand: PartHand::Auto,
+        })
+        .collect();
+    import_parts(bytes, &choices)
+}
+
+/// Importa solo las partes elegidas, con la mano indicada para cada una.
+pub fn import_parts(bytes: &[u8], choices: &[PartChoice]) -> Result<Piece, MidiImportError> {
+    let parsed = parse(bytes)?;
+    let hand_of = |id: &PartId| choices.iter().find(|c| c.part == *id).map(|c| c.hand);
+    let mut notes: Vec<(PartId, Note)> = parsed
+        .notes
+        .into_iter()
+        .filter(|(id, _)| hand_of(id).is_some())
+        .collect();
+
+    // Las partes en automático se reparten entre las dos manos.
+    let mut auto: Vec<(PartId, Note)> = Vec::new();
+    let mut fixed: Vec<Note> = Vec::new();
+    for (id, mut n) in notes.drain(..) {
+        match hand_of(&id).unwrap_or_default() {
+            PartHand::Auto => auto.push((id, n)),
+            PartHand::Right => {
+                n.hand = Hand::Right;
+                fixed.push(n);
+            }
+            PartHand::Left => {
+                n.hand = Hand::Left;
+                fixed.push(n);
+            }
+            PartHand::Split => {
+                n.hand = hand_by_split(n.pitch, DEFAULT_HAND_SPLIT);
+                fixed.push(n);
+            }
+        }
+    }
+    assign_hands_by_part(&mut auto);
 
     let mut piece = Piece::new(
-        Metadata::titled(title.unwrap_or_else(|| "Sin título".to_string())),
-        TempoMap::new(ppq, tempo_changes)?,
+        Metadata::titled(parsed.title.unwrap_or_else(|| "Sin título".to_string())),
+        TempoMap::new(parsed.ppq, parsed.tempo_changes)?,
     );
     piece.provenance = Some(Provenance {
         source: "importado por el usuario".to_string(),
@@ -157,10 +355,10 @@ pub fn import_smf(bytes: &[u8]) -> Result<Piece, MidiImportError> {
         confidence: Confidence::D,
         reviewers: Vec::new(),
     });
-    piece.time_signatures = time_signatures;
-    piece.notes = notes.into_iter().map(|(_, n)| n).collect();
+    piece.time_signatures = parsed.time_signatures;
+    piece.notes = auto.into_iter().map(|(_, n)| n).chain(fixed).collect();
     resolve_overlaps(&mut piece.notes);
-    piece.sustain = sustain;
+    piece.sustain = parsed.sustain;
     piece.sort_notes();
     Ok(piece)
 }
@@ -181,8 +379,8 @@ fn note(pitch: u8, velocity: u8, start_tick: u64, end_tick: u64) -> Note {
 /// es la mano derecha. Así funciona tanto con una pista por mano como con
 /// una pista por voz (lo que generan muchos editores de partituras). Con una
 /// sola pista se divide por altura en el Do central.
-fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
-    let mut by_track: HashMap<usize, (u64, u64)> = HashMap::new(); // pista -> (suma de alturas, cantidad)
+fn assign_hands_by_part(notes: &mut [(PartId, Note)]) {
+    let mut by_track: HashMap<PartId, (u64, u64)> = HashMap::new(); // parte -> (suma de alturas, cantidad)
     for (track, n) in notes.iter() {
         let entry = by_track.entry(*track).or_default();
         entry.0 += u64::from(n.pitch);
@@ -190,7 +388,7 @@ fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
     }
 
     if by_track.len() >= 2 {
-        let mut tracks: Vec<(usize, f64)> = by_track
+        let mut tracks: Vec<(PartId, f64)> = by_track
             .into_iter()
             .map(|(t, (sum, count))| (t, sum as f64 / count as f64))
             .collect();
@@ -202,7 +400,7 @@ fn assign_hands_by_track(notes: &mut [(usize, Note)]) {
                 gap_a.total_cmp(&gap_b)
             })
             .expect("hay al menos dos pistas");
-        let left: Vec<usize> = tracks[..split].iter().map(|(t, _)| *t).collect();
+        let left: Vec<PartId> = tracks[..split].iter().map(|(t, _)| *t).collect();
         for (track, n) in notes.iter_mut() {
             n.hand = if left.contains(track) {
                 Hand::Left

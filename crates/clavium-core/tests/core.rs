@@ -509,3 +509,150 @@ fn import_groups_voice_tracks_into_two_hands() {
         assert_eq!(n.hand, expected, "nota {}", n.pitch);
     }
 }
+
+// --- Importación por partes (MIDI de canciones) ---
+
+fn on_ch(delta: u32, channel: u8, key: u8) -> TrackEvent<'static> {
+    ev(
+        delta,
+        TrackEventKind::Midi {
+            channel: u4::new(channel),
+            message: MidiMessage::NoteOn {
+                key: u7::new(key),
+                vel: u7::new(90),
+            },
+        },
+    )
+}
+
+fn off_ch(delta: u32, channel: u8, key: u8) -> TrackEvent<'static> {
+    ev(
+        delta,
+        TrackEventKind::Midi {
+            channel: u4::new(channel),
+            message: MidiMessage::NoteOff {
+                key: u7::new(key),
+                vel: u7::new(0),
+            },
+        },
+    )
+}
+
+fn program(channel: u8, program: u8) -> TrackEvent<'static> {
+    ev(
+        0,
+        TrackEventKind::Midi {
+            channel: u4::new(channel),
+            message: MidiMessage::ProgramChange {
+                program: u7::new(program),
+            },
+        },
+    )
+}
+
+fn name(text: &'static str) -> TrackEvent<'static> {
+    ev(
+        0,
+        TrackEventKind::Meta(MetaMessage::TrackName(text.as_bytes())),
+    )
+}
+
+/// Una canción: piano en dos pistas, bajo eléctrico y batería en el canal 10.
+fn song() -> Vec<u8> {
+    smf_bytes(
+        Format::Parallel,
+        480,
+        vec![
+            vec![name("Mi canción"), tempo(0, 500_000), end()],
+            vec![
+                name("Piano R"),
+                program(0, 0),
+                on_ch(0, 0, 72),
+                off_ch(480, 0, 72),
+                end(),
+            ],
+            vec![
+                name("Piano L"),
+                program(1, 0),
+                on_ch(0, 1, 48),
+                off_ch(480, 1, 48),
+                end(),
+            ],
+            vec![
+                name("Bajo"),
+                program(2, 33),
+                on_ch(0, 2, 36),
+                off_ch(480, 2, 36),
+                end(),
+            ],
+            vec![
+                name("Batería"),
+                on_ch(0, 9, 36),
+                off_ch(120, 9, 36),
+                on_ch(0, 9, 38),
+                off_ch(120, 9, 38),
+                end(),
+            ],
+        ],
+    )
+}
+
+#[test]
+fn parts_are_listed_with_their_instrument() {
+    use clavium_core::midi::inspect_parts;
+    let parts = inspect_parts(&song()).unwrap();
+    let summary: Vec<_> = parts
+        .iter()
+        .map(|p| (p.name.as_str(), p.instrument(), p.is_piano(), p.notes))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("Piano R", "Piano", true, 1),
+            ("Piano L", "Piano", true, 1),
+            ("Bajo", "Bajo", false, 1),
+            ("Batería", "Batería", false, 2),
+        ]
+    );
+}
+
+#[test]
+fn default_choice_is_the_piano_and_drums_are_never_imported_by_default() {
+    use clavium_core::midi::{default_choices, import_smf, inspect_parts};
+    let bytes = song();
+    let parts = inspect_parts(&bytes).unwrap();
+    let chosen: Vec<_> = default_choices(&parts).iter().map(|c| c.part).collect();
+    assert_eq!(chosen, vec![(1, 0), (2, 1)]);
+    // Importar todo deja afuera la batería: 3 notas de piano y bajo.
+    assert_eq!(import_smf(&bytes).unwrap().notes.len(), 3);
+}
+
+#[test]
+fn each_part_can_go_to_a_chosen_hand() {
+    use clavium_core::midi::{PartChoice, PartHand, import_parts};
+    let piece = import_parts(
+        &song(),
+        &[
+            PartChoice {
+                part: (1, 0),
+                hand: PartHand::Auto,
+            },
+            PartChoice {
+                part: (2, 1),
+                hand: PartHand::Auto,
+            },
+            // El bajo a la mano izquierda, aunque las partes automáticas ya la usen.
+            PartChoice {
+                part: (3, 2),
+                hand: PartHand::Left,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(piece.metadata.title, "Mi canción");
+    let hands: Vec<(u8, Hand)> = piece.notes.iter().map(|n| (n.pitch, n.hand)).collect();
+    assert!(hands.contains(&(72, Hand::Right)));
+    assert!(hands.contains(&(48, Hand::Left)));
+    assert!(hands.contains(&(36, Hand::Left)));
+    assert_eq!(piece.notes.len(), 3);
+}

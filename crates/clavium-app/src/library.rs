@@ -7,11 +7,14 @@ use std::path::{Path, PathBuf};
 use clavium_core::notation::parse_piece;
 use clavium_core::{Arrangement, Hand, Piece, clav};
 
-use crate::catalog;
+use crate::{catalog, mine};
 
 mod bundled {
     include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
 }
+
+/// Nombre del grupo de piezas importadas por el usuario.
+pub const MY_PIECES: &str = "Mis piezas";
 
 pub struct LibraryEntry {
     pub id: String,
@@ -24,6 +27,8 @@ pub struct LibraryEntry {
     pub draft: bool,
     /// Revisada por el usuario de esta app (se guarda en la base local).
     pub reviewed_here: bool,
+    /// Importada por el usuario ("Mis piezas").
+    pub mine: bool,
     pub style: Option<String>,
     /// Clave estable del compositor, para agrupar.
     pub composer_key: Option<String>,
@@ -50,6 +55,7 @@ impl LibraryEntry {
                 .is_none_or(|p| p.reviewers.is_empty()),
             credit: None,
             reviewed_here: false,
+            mine: false,
             style: meta.style.clone(),
             composer_key: None,
             piece: Some(piece),
@@ -167,7 +173,7 @@ pub struct Library {
 }
 
 impl Library {
-    pub fn load(catalog_dir: &Path) -> Self {
+    pub fn load(catalog_dir: &Path, mine_dir: &Path) -> Self {
         let mut entries: Vec<LibraryEntry> = bundled::BUNDLED
             .iter()
             .map(|(id, text)| {
@@ -176,7 +182,32 @@ impl Library {
                 LibraryEntry::from_piece(id.to_string(), piece)
             })
             .collect();
-        let groups = group_by_routes(&entries, bundled::ROUTES);
+        let mut groups = group_by_routes(&entries, bundled::ROUTES);
+
+        // Mis piezas: las que importó el usuario, primero.
+        let mine_start = entries.len();
+        for (id, path) in mine::list(mine_dir) {
+            if let Ok(piece) = clav::load(&path) {
+                let mut entry = LibraryEntry::from_piece(id, piece);
+                entry.mine = true;
+                // Son del usuario: no tiene sentido marcarlas como sin revisar.
+                entry.draft = false;
+                entry.credit =
+                    Some("Importada por vos. Solo está guardada en esta computadora.".into());
+                entry.path = Some(path);
+                entries.push(entry);
+            }
+        }
+        if entries.len() > mine_start {
+            groups.insert(
+                0,
+                Group {
+                    name: MY_PIECES.to_string(),
+                    entries: (mine_start..entries.len()).collect(),
+                    is_route: false,
+                },
+            );
+        }
 
         let catalog_start = entries.len();
         if let Some(index) = catalog::load_index(catalog_dir) {
@@ -191,6 +222,7 @@ impl Library {
                     arrangement: Arrangement::Original,
                     draft: !item.reviewed,
                     reviewed_here: false,
+                    mine: false,
                     style: item.style,
                     composer_key: item.composer_key,
                     piece: None,
@@ -396,7 +428,7 @@ mod tests {
     use super::*;
 
     fn no_catalog() -> Library {
-        Library::load(Path::new("no-existe"))
+        Library::load(Path::new("no-existe"), Path::new("no-existe"))
     }
 
     #[test]

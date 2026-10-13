@@ -5,7 +5,7 @@
 //! los acordes, los saltos, cuántas notas suenan a la vez y cuánto dura.
 //! Se puede corregir a mano en el catálogo.
 
-use crate::model::{Hand, Piece};
+use crate::model::{Hand, Piece, Section};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Features {
@@ -126,6 +126,28 @@ pub fn features(piece: &Piece) -> Features {
         minutes: seconds / 60.0,
         peak_notes_per_second,
     }
+}
+
+/// Compases por sección automática, para practicar obras largas por partes.
+pub const BARS_PER_SECTION: usize = 8;
+
+/// Secciones de `BARS_PER_SECTION` compases: "Compases 1–8", "Compases 9–16"…
+pub fn auto_sections(piece: &Piece) -> Vec<Section> {
+    let bars = piece.bar_ticks();
+    let end = piece.end_tick();
+    bars.chunks(BARS_PER_SECTION)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let first = i * BARS_PER_SECTION + 1;
+            let last = first + chunk.len() - 1;
+            let next = bars.get((i + 1) * BARS_PER_SECTION).copied().unwrap_or(end);
+            Section {
+                name: format!("Compases {first}–{last}"),
+                start_tick: chunk[0],
+                end_tick: next,
+            }
+        })
+        .collect()
 }
 
 /// Puntaje de dificultad: más alto, más difícil. Sirve para ordenar.
